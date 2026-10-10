@@ -10,6 +10,8 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <shlobj.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 #define OBJ(o) ((NrObj*)(o))
 #define STR(o) ((NrString*)(o))
@@ -163,7 +165,8 @@ static void* String_InternalSplit(void* self, void* seps, int32_t count, int32_t
     NrString* s = STR(self);
     int remove_empty = options & 1;
     int n = 0, start = 0;
-    void** parts = (void**)malloc(sizeof(void*) * ((size_t)s->length + 1));
+    /* scanned memory: the parts are only reachable from here while later ones allocate */
+    void** parts = (void**)GC_MALLOC(sizeof(void*) * ((size_t)s->length + 1));
     for (int i = 0; i <= s->length && n < count; i++)
     {
         int last = n == count - 1;
@@ -183,7 +186,7 @@ static void* String_InternalSplit(void* self, void* seps, int32_t count, int32_t
     }
     void* arr = nr_new_string_array(n);
     for (int i = 0; i < n; i++) ((void**)ARR(arr)->vector)[i] = parts[i];
-    free(parts);
+    GC_FREE(parts);
     return arr;
 }
 
@@ -1066,6 +1069,19 @@ static void* Path_get_temp_path(void)
     return nr_str_utf16((uint16_t*)buf, (int32_t)n);
 }
 
+/* ---- RNGCryptoServiceProvider: the system RNG, no per-instance state ---- */
+
+static uint8_t Rng_Open(void) { return 1; }
+static intptr_t Rng_Initialize(void* seed) { (void)seed; return 1; }
+static intptr_t Rng_GetBytes(intptr_t h, void* data)
+{
+    NrArray* a = ARR(data);
+    if (a->max_length && BCryptGenRandom(0, (PUCHAR)a->vector, a->max_length, BCRYPT_USE_SYSTEM_PREFERRED_RNG))
+        nr_throw_new("System.Security.Cryptography", "CryptographicException", "BCryptGenRandom failed");
+    return h;
+}
+static void Rng_Close(intptr_t h) { (void)h; }
+
 /* ---- Encoding / culture ---- */
 
 static void* Encoding_InternalCodePage(int32_t* cp)
@@ -1085,13 +1101,14 @@ static uint8_t CultureInfo_false2s(void* a, void* b) { (void)a; (void)b; return 
 static void CultureInfo_void1(void* a) { (void)a; }
 
 /* CompareInfo without ICU: ordinal, or case-insensitive ordinal. */
+#define IGNORE_CASE(opts) (((opts) & 1) || ((opts) & 0x10000000))   /* IgnoreCase, OrdinalIgnoreCase */
 static uint16_t up(uint16_t c) { return (uint16_t)(uintptr_t)CharUpperW((LPWSTR)(uintptr_t)c); }
 static int32_t CompareInfo_internal_compare(void* self, void* s1, int32_t o1, int32_t l1, void* s2, int32_t o2, int32_t l2, int32_t opts)
 {
     (void)self;
     const uint16_t* a = STR(s1)->chars + o1;
     const uint16_t* b = STR(s2)->chars + o2;
-    int ic = opts & 1;
+    int ic = IGNORE_CASE(opts);
     if (!(opts & 0x40000000) && !(opts & 0x10000000))
     {
         int r = CompareStringW(LOCALE_INVARIANT, ic ? NORM_IGNORECASE : 0, (LPCWCH)a, l1, (LPCWCH)b, l2);
@@ -1109,7 +1126,7 @@ static int32_t CompareInfo_internal_index_char(void* self, void* s, int32_t star
 {
     (void)self;
     const uint16_t* p = STR(s)->chars;
-    int ic = opts & 1;
+    int ic = IGNORE_CASE(opts);
     uint16_t cc = ic ? up(c) : c;
     if (first) { for (int i = start; i < start + count; i++) if ((ic ? up(p[i]) : p[i]) == cc) return i; }
     else { for (int i = start; i > start - count; i--) if ((ic ? up(p[i]) : p[i]) == cc) return i; }
@@ -1120,7 +1137,7 @@ static int32_t CompareInfo_internal_index_str(void* self, void* s, int32_t start
     (void)self;
     const uint16_t* p = STR(s)->chars;
     const uint16_t* q = STR(v)->chars;
-    int m = STR(v)->length, ic = opts & 1;
+    int m = STR(v)->length, ic = IGNORE_CASE(opts);
     if (m == 0) return first ? start : start;
     if (first)
     {
@@ -1459,6 +1476,10 @@ static const NrIcall corlib[] = {
     { "System.Globalization.CultureInfo::construct_datetime_format", CultureInfo_void1 },
     { "System.Globalization.CultureInfo::construct_number_format", CultureInfo_void1 },
     { "System.Globalization.CultureInfo::internal_is_lcid_neutral", CultureInfo_false2 },
+    { "System.Security.Cryptography.RNGCryptoServiceProvider::RngOpen", Rng_Open },
+    { "System.Security.Cryptography.RNGCryptoServiceProvider::RngInitialize", Rng_Initialize },
+    { "System.Security.Cryptography.RNGCryptoServiceProvider::RngGetBytes", Rng_GetBytes },
+    { "System.Security.Cryptography.RNGCryptoServiceProvider::RngClose", Rng_Close },
     { "System.Globalization.CompareInfo::internal_compare", CompareInfo_internal_compare },
     { "System.Globalization.CompareInfo::internal_index(string,int,int,char,System.Globalization.CompareOptions,bool)", CompareInfo_internal_index_char },
     { "System.Globalization.CompareInfo::internal_index(string,int,int,string,System.Globalization.CompareOptions,bool)", CompareInfo_internal_index_str },

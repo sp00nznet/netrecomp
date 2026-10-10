@@ -52,7 +52,13 @@ sealed class Gen
         return m.CName;
     }
 
-    public string Klass(TT t) { klassUsed.Add(t); return "K" + Lay.Id(t); }
+    public string Klass(TT t)
+    {
+        // the runtime boxes enums it never saw boxed in IL (Array.GetValue on an
+        // array made by CreateInstance, reflection), so each needs a vtable
+        if (klassUsed.Add(t) && t.K == TK.Def && t.Def.IsEnum && !t.IsOpen) Construct(t);
+        return "K" + Lay.Id(t);
+    }
     public string ObjStruct(TT t) { objUsed.Add(t); Lay.Full(t); return "O" + Lay.Id(t); }
     public string Statics(TT t) { staticsUsed.Add(t); Lay.Full(t); Klass(t); return "S" + Lay.Id(t); }
     public string FieldC(FI f) { var L = Lay.Full(f.Owner); if (!L.FieldName.TryGetValue(f.Def, out var n)) throw new Exception($"field {f.Def} of {f.Owner.Key}: owner def same={f.Owner.Def == f.Def.DeclaringType} names={string.Join(",", L.FieldName.Keys.Select(k => k.Name))} done={L.Done} kind={f.Owner.K}"); return n; }
@@ -335,8 +341,8 @@ sealed class Gen
         var genericArg = m.MArgs.Length > 0 ? $"(NrClass*)&{Klass(m.MArgs[0])}" : "0";
         // Generic icalls (Array.GetGenericValueImpl<T>) get T's class as a trailing hidden argument.
         if (m.MArgs.Length > 0)
-            return $"{Proto(m)}\n{{\n    static void* fn;\n    if (!fn) fn = nr_icall(\"{CEsc(full)}\", \"{CEsc(key)}\");\n    {(rt == "void" ? "" : "return ")}(({rt} (*)({string.Join(", ", Params(m).Append("NrClass*"))}))fn)({string.Join(", ", Params(m).Select((_, i) => $"a{i}").Append(genericArg))});\n}}\n";
-        return $"{Proto(m)}\n{{\n    static void* fn;\n    if (!fn) fn = nr_icall(\"{CEsc(full)}\", \"{CEsc(key)}\");\n    {(rt == "void" ? "" : "return ")}(({ft})fn)({args});\n}}\n";
+            return $"{Proto(m)}\n{{\n    static void* fn;\n    if (!fn) fn = nr_icall(\"{CEsc(full)}\", \"{CEsc(key)}\");\n    NR_ICALL_TRACE(\"{CEsc(key)}\");\n    {(rt == "void" ? "" : "return ")}(({rt} (*)({string.Join(", ", Params(m).Append("NrClass*"))}))fn)({string.Join(", ", Params(m).Select((_, i) => $"a{i}").Append(genericArg))});\n}}\n";
+        return $"{Proto(m)}\n{{\n    static void* fn;\n    if (!fn) fn = nr_icall(\"{CEsc(full)}\", \"{CEsc(key)}\");\n    NR_ICALL_TRACE(\"{CEsc(key)}\");\n    {(rt == "void" ? "" : "return ")}(({ft})fn)({args});\n}}\n";
     }
 
     // P/Invoke: blittable arguments pass through; strings, bools and arrays

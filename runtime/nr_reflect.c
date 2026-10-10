@@ -722,8 +722,22 @@ static intptr_t Assembly_GetManifestResourceInternal(void* self, void* name, int
 static void Assembly_FillName(void* asm_obj, void* aname)
 {
     NrClass* k = OBJ(aname)->klass;
-    const NrFieldDesc* f = nr_field(k, "name");
-    if (f) *(void**)((char*)aname + f->offset) = nr_str_utf8(asm_image(asm_obj)->name);
+    NrImage* img = asm_image(asm_obj);
+    SETF(aname, void*, k, "name", nr_str_utf8(img->name));
+    /* the version comes from the full name, "X, Version=a.b.c.d, ..." */
+    int v[4] = { 0, 0, 0, 0 };
+    const char* p = img->fullname ? strstr(img->fullname, "Version=") : 0;
+    if (p) sscanf(p + 8, "%d.%d.%d.%d", &v[0], &v[1], &v[2], &v[3]);
+    SETF(aname, int32_t, k, "major", v[0]); SETF(aname, int32_t, k, "minor", v[1]);
+    SETF(aname, int32_t, k, "build", v[2]); SETF(aname, int32_t, k, "revision", v[3]);
+    NrClass* vk = nr_class_by_name("System", "Version");
+    if (vk)
+    {
+        void* ver = nr_new(vk);
+        SETF(ver, int32_t, vk, "_Major", v[0]); SETF(ver, int32_t, vk, "_Minor", v[1]);
+        SETF(ver, int32_t, vk, "_Build", v[2]); SETF(ver, int32_t, vk, "_Revision", v[3]);
+        SETF(aname, void*, k, "version", ver);
+    }
 }
 static void* Assembly_GetReferencedAssemblies(void* self) { (void)self; return new_array(nr_class_by_name("System.Reflection", "AssemblyName"), 0); }
 static void* Assembly_InternalImageRuntimeVersion(void* self) { (void)self; return nr_str_utf8("v2.0.50727"); }

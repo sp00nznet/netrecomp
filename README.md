@@ -75,7 +75,12 @@ py -3 tools\conformance.py --corlib <Managed dir>
 - `--exe` compiles a console program against the folder's corlib, and `build.py --exe`
   links it with `runtime/host_exe.c`.
 - `NR_DEBUG=1` makes the runtime print every throw and hardware fault with a symbolized
-  native stack.
+  native stack and an annotated dump of the faulting stack.
+- `NR_TRACE=1` logs every mono API call Unity makes (with invoke targets and icall
+  registrations); `NR_TRACE_ICALLS=1` logs every internal call managed code makes;
+  `NR_LOG=<file>` sends all of it to a file.
+- `NR_INPUT=<file>` drives the game window from a command file (`click X Y`, `move`,
+  `key VK`, `wait MS`) without touching the real mouse; see `docs/unity-host.md`.
 
 ## Conformance
 

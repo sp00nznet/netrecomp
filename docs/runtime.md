@@ -41,7 +41,10 @@ and `ArithmeticException`. A fault seen by several filters becomes one object (c
 exception record). Because these are ordinary SEH exceptions they unwind through native
 engine frames the way mono's did.
 
-`NR_DEBUG=1` prints every throw and fault with a symbolized native stack.
+`NR_DEBUG=1` prints every throw and fault with a symbolized native stack, the words around
+the faulting ESP (module offsets and GC object classes), and what memory an address outside
+every module lies in. `nr_debug_watch(addr)` arms a hardware write watchpoint on the calling
+thread and logs each writer; it is for temporary probes in generated code.
 
 ## Internal calls
 

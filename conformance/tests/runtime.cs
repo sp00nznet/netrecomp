@@ -117,6 +117,8 @@ static class Program
         Console.WriteLine(new FileInfo(path).Length);
         File.Delete(path);
         Console.WriteLine(File.Exists(path));
+        Guid g1 = Guid.NewGuid(), g2 = Guid.NewGuid();
+        Console.WriteLine((g1 != Guid.Empty) + " " + (g1 != g2) + " " + g1.ToString().Length);
         return 0;
     }
 

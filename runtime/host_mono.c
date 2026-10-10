@@ -72,7 +72,8 @@ static void ensure_init(void)
 /* ---- runtime set-up: mostly accepted and ignored ---- */
 
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); return &root_domain; }
+void nr_input_start(void);
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
@@ -133,7 +134,12 @@ void* nr_pinvoke_fallback(const char* lib, const char* entry)
 }
 
 /* Unity's engine calls, by "Namespace.Type::Method" */
-API void mono_add_internal_call(const char* name, const void* fn) { TR("mono_add_internal_call"); ensure_init(); nr_add_icall(name, fn); }
+API void mono_add_internal_call(const char* name, const void* fn)
+{
+    TR("mono_add_internal_call");
+    if (trace_on > 0) nr_log("[mono]   icall %s = exe+0x%x\n", name, (unsigned)((const char*)fn - (const char*)GetModuleHandleA(0)));
+    ensure_init(); nr_add_icall(name, fn);
+}
 
 /* ---- domains ---- */
 
@@ -482,7 +488,9 @@ API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, v
 {
     TR("mono_runtime_invoke");
     if (!m) { if (exc) *exc = 0; return 0; }
-    return nr_invoke(m, obj, params, exc);
+    void* r = nr_invoke(m, obj, params, exc);
+    if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
+    return r;
 }
 API void* mono_runtime_delegate_invoke(void* d, void** params, void** exc)
 {
@@ -557,18 +565,118 @@ API void mono_raise_exception(void* e) { TR("mono_raise_exception"); nr_throw(e)
 API uint32_t mono_gchandle_new(void* o, gboolean pinned) { TR("mono_gchandle_new"); return nr_gchandle_new(o, pinned); }
 API uint32_t mono_gchandle_new_weakref(void* o, gboolean track) { TR("mono_gchandle_new_weakref"); (void)track; return nr_gchandle_new_weak(o); }
 API void* mono_gchandle_get_target(uint32_t h) { TR("mono_gchandle_get_target"); return nr_gchandle_target(h); }
-API void mono_gchandle_free(uint32_t h) { TR("mono_gchandle_free"); nr_gchandle_free(h); }
+API void mono_gchandle_free(uint32_t h)
+{
+    TR("mono_gchandle_free");
+    if (trace_on > 0) { NrObj* o = (NrObj*)nr_gchandle_target(h); nr_log("[mono]   free %s %p\n", o ? o->klass->name : "-", (void*)o); }
+    nr_gchandle_free(h);
+}
 API gboolean mono_gchandle_is_in_domain(uint32_t h, NrDomain* d) { TR("mono_gchandle_is_in_domain"); (void)h; (void)d; return 1; }
 API void mono_gc_collect(int gen) { TR("mono_gc_collect"); (void)gen; GC_gcollect(); }
 API int mono_gc_max_generation(void) { TR("mono_gc_max_generation"); return 0; }
 API int64_t mono_gc_get_heap_size(void) { TR("mono_gc_get_heap_size"); return (int64_t)GC_get_heap_size(); }
 API int64_t mono_gc_get_used_size(void) { TR("mono_gc_get_used_size"); return (int64_t)GC_get_heap_size() - (int64_t)GC_get_free_bytes(); }
 
-/* Unity's memory profiler walks the heap through these; nothing to report. */
-API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, void* cb, void* user) { TR("mono_unity_liveness_calculation_begin"); (void)filter; (void)max; (void)cb; (void)user; static int dummy; return &dummy; }
-API void mono_unity_liveness_calculation_end(void* s) { TR("mono_unity_liveness_calculation_end"); (void)s; }
-API void mono_unity_liveness_calculation_from_root(void* root, void* s) { TR("mono_unity_liveness_calculation_from_root"); (void)root; (void)s; }
-API void mono_unity_liveness_calculation_from_statics(void* s) { TR("mono_unity_liveness_calculation_from_statics"); (void)s; }
+/* Liveness: Resources.UnloadUnusedAssets (and scene loads) ask which
+ * UnityEngine.Objects managed code reaches from each root Unity names and from
+ * statics, and unload the rest. Results go to the callback at the end of each
+ * from_root / from_statics call, because Unity attributes them to that root;
+ * the visited set spans the whole calculation, so each object is reported once.
+ * The walk is conservative: any word holding the start of a GC object whose
+ * first word is a class record counts as a reference. Over-reporting only
+ * keeps an asset loaded; under-reporting unloads one that is still in use. */
+typedef void (*LivenessCb)(void** objs, int n, void* user);
+typedef struct Liveness {
+    NrClass* filter; LivenessCb cb; void* user;
+    void** out; uint32_t n_out, max_out;
+    void** seen; uint32_t seen_cap, n_seen;    /* open-addressing set */
+    void** work; uint32_t n_work, work_cap;
+} Liveness;
+
+extern IMAGE_DOS_HEADER __ImageBase;
+static NrClass* live_class(void* p)
+{
+    if (!p || ((uintptr_t)p & 3) || GC_base(p) != p) return 0;
+    NrClass* k = *(NrClass**)p;
+    if (!k || ((uintptr_t)k & 3)) return 0;
+    char* img = (char*)&__ImageBase;
+    size_t img_size = ((IMAGE_NT_HEADERS*)(img + __ImageBase.e_lfanew))->OptionalHeader.SizeOfImage;
+    if (!((char*)k >= img && (char*)k < img + img_size) && !GC_base(k)) return 0;
+    return k->self == k ? k : 0;
+}
+static int live_mark(Liveness* s, void* p)
+{
+    if (s->n_seen * 2 >= s->seen_cap)
+    {
+        uint32_t oc = s->seen_cap; void** old = s->seen;
+        s->seen_cap = oc ? oc * 2 : 1 << 16;
+        s->seen = (void**)calloc(s->seen_cap, sizeof(void*));
+        s->n_seen = 0;
+        for (uint32_t i = 0; i < oc; i++) if (old[i]) live_mark(s, old[i]);
+        free(old);
+    }
+    uint32_t m = s->seen_cap - 1, h = (uint32_t)((uintptr_t)p >> 3) * 2654435761u & m;
+    for (; s->seen[h]; h = (h + 1) & m) if (s->seen[h] == p) return 0;
+    s->seen[h] = p; s->n_seen++;
+    return 1;
+}
+static void live_flush(Liveness* s) { if (s->n_out) s->cb(s->out, (int)s->n_out, s->user); s->n_out = 0; }
+static void live_push(Liveness* s, void* p)
+{
+    NrClass* k = live_class(p);
+    if (!k || !live_mark(s, p)) return;
+    if (!s->filter || nr_assignable(s->filter, k))
+    {
+        s->out[s->n_out++] = p;
+        if (s->n_out == s->max_out) live_flush(s);
+    }
+    if (!(k->flags & NR_HAS_REFS)) return;
+    if (s->n_work == s->work_cap) { s->work_cap = s->work_cap ? s->work_cap * 2 : 4096; s->work = (void**)realloc(s->work, s->work_cap * sizeof(void*)); }
+    s->work[s->n_work++] = p;
+}
+static void live_scan(Liveness* s, void* const* from, size_t words)
+{
+    for (size_t i = 0; i < words; i++) live_push(s, from[i]);
+    while (s->n_work)
+    {
+        void** o = (void**)s->work[--s->n_work];
+        size_t n = GC_size(o) / sizeof(void*);
+        for (size_t i = 2; i < n; i++) live_push(s, o[i]);
+    }
+}
+API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, LivenessCb cb, void* user)
+{
+    TR("mono_unity_liveness_calculation_begin");
+    Liveness* s = (Liveness*)calloc(1, sizeof *s);
+    s->filter = filter; s->cb = cb; s->user = user;
+    s->max_out = max && max < 64 ? max : 64;
+    s->out = (void**)malloc(s->max_out * sizeof(void*));
+    GC_disable();   /* nothing is freed while the walk holds raw pointers */
+    return s;
+}
+API void mono_unity_liveness_calculation_end(Liveness* s)
+{
+    TR("mono_unity_liveness_calculation_end");
+    live_flush(s);
+    GC_enable();
+    free(s->out); free(s->seen); free(s->work); free(s);
+}
+API void mono_unity_liveness_calculation_from_root(void* root, Liveness* s)
+{
+    TR("mono_unity_liveness_calculation_from_root");
+    live_scan(s, &root, 1);
+    live_flush(s);
+}
+API void mono_unity_liveness_calculation_from_statics(Liveness* s)
+{
+    TR("mono_unity_liveness_calculation_from_statics");
+    for (int i = 0; i < nr_n_classes; i++)
+    {
+        NrClass* k = nr_classes[i];
+        if (k && k->statics) live_scan(s, (void* const*)k->statics, k->statics_size / sizeof(void*));
+    }
+    live_flush(s);
+}
 
 /* ---- threads ---- */
 
