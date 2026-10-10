@@ -71,7 +71,11 @@ def main():
         obj = os.path.join(objdir, ("bdwgc_" if src.startswith(GC_DIR) else "") + base + ".obj")
         if os.path.exists(obj) and os.path.getmtime(obj) > max(os.path.getmtime(src), hdr_time):
             return obj, None
-        r = subprocess.run([cc] + flags + [src, "/Fo" + obj],
+        f = flags
+        if base in ("meta", "chartab", "fmttab"):
+            # tables: optimizing 40 MB of initializers buys nothing and takes 15 minutes
+            f = [x if x != a.opt else "-O0" for x in flags]
+        r = subprocess.run([cc] + f + [src, "/Fo" + obj],
                            capture_output=True, text=True, env=env)
         return obj, (r.stdout + r.stderr if r.returncode else None)
 
@@ -96,7 +100,7 @@ def main():
     args = link + ["/nologo", "/machine:x86", "/debug", "/out:" + a.out, "@" + rsp,
                    "kernel32.lib", "user32.lib", "ole32.lib", "oleaut32.lib", "advapi32.lib", "shell32.lib", "ws2_32.lib"]
     if not a.exe:
-        args += ["/dll", "/def:" + os.path.join(RUNTIME, "mono.def")]
+        args += ["/dll"]
     else:
         args += ["/subsystem:console"]
     r = subprocess.run(args, capture_output=True, text=True, env=env)

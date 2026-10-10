@@ -678,7 +678,11 @@ static DWORD WINAPI thread_main(LPVOID p)
     if (ex)
     {
         NrClass* k = OBJ(ex)->klass;
-        if (strcmp(k->name, "ThreadAbortException")) nr_log("netrecomp: unhandled exception %s.%s on thread %lu\n", k->ns, k->name, GetCurrentThreadId());
+        if (strcmp(k->name, "ThreadAbortException"))
+        {
+            nr_log("netrecomp: unhandled exception %s.%s on thread %lu\n", k->ns, k->name, GetCurrentThreadId());
+            if (nr_unhandled_hook) nr_unhandled_hook(ex);
+        }
     }
     FIELD(t, int32_t, off_thread_state) = 16;  /* Stopped */
     nr_gchandle_free(tinfo->handle);

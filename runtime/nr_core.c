@@ -8,19 +8,38 @@
 #include "nrrt.h"
 #include <stdarg.h>
 
+extern IMAGE_DOS_HEADER __ImageBase;
+
 NrClass *nr_k_object, *nr_k_string, *nr_k_array, *nr_k_monotype, *nr_k_void, *nr_k_int32,
     *nr_k_bool, *nr_k_char, *nr_k_byte, *nr_k_int64, *nr_k_double, *nr_k_single, *nr_k_intptr,
     *nr_k_exception, *nr_k_valuetype, *nr_k_enum, *nr_k_delegate, *nr_k_thread, *nr_k_objarr;
 int nr_log_missing = 1;
-void (*nr_find_plugin)(const char* name, char* out, int outsize);
+void* (*nr_pinvoke_hook)(const char* lib, const char* entry);
+void (*nr_unhandled_hook)(void* exc);
 
+/* stderr, and the file named by NR_LOG when set (a Unity player has no console). */
 void nr_log(const char* fmt, ...)
 {
+    static FILE* f;
+    static int opened;
+    if (!opened)
+    {
+        char p[MAX_PATH];
+        opened = 1;
+        if (GetEnvironmentVariableA("NR_LOG", p, MAX_PATH)) f = fopen(p, "a");
+    }
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fflush(stderr);
+    if (f)
+    {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fflush(f);
+    }
 }
 
 void nr_free(void* p) { free(p); }
@@ -92,7 +111,7 @@ NrClass* nr_array_class(NrClass* elem, int rank)
     NrClass** s = (NrClass**)malloc(sizeof(NrClass*) * 3);
     s[0] = nr_k_object; s[1] = nr_k_array; s[2] = k;
     k->supers = s; k->depth = 2;
-    k->byval_arg.klass = k; k->byval_arg.type = rank == 1 ? 0x1d : 0x14; k->this_arg = k->byval_arg; k->this_arg.byref = 1;
+    k->byval_arg.klass = k; k->byval_arg.data = elem; k->byval_arg.type = rank == 1 ? 0x1d : 0x14; k->this_arg = k->byval_arg; k->this_arg.bits = 0x40;
     k->type_obj = 0; k->szarray = 0; k->fields = 0; k->n_fields = 0; k->methods = 0; k->n_methods = 0;
     (void)sup;
     struct DynArr* d = (struct DynArr*)malloc(sizeof *d);
@@ -499,10 +518,34 @@ void nr_delegate_init(void* p, void* target, void* fn, const NrMethodDesc* m)
     d->method = (void*)m;
 }
 
+/* A thunk slot of the delegate type's pool, bound to this delegate. The
+ * binding holds the delegate alive (native code may call it any time).
+ * ponytail: slots are never released; 32 per delegate type. */
+static CRITICAL_SECTION rev_lock;
 void* nr_delegate_to_fnptr(void* d)
 {
     if (!d) return 0;
-    nr_throw_notsupported("marshalling a delegate to a native function pointer");
+    NrClass* k = ((NrObj*)d)->klass;
+    const NrRevPool* p = k->rev_pool;
+    if (!p) nr_throw_notsupported("marshalling this delegate type to a native function pointer (no thunk pool)");
+    EnterCriticalSection(&rev_lock);
+    int free_slot = -1;
+    for (int i = 0; i < p->n; i++)
+    {
+        if (!p->handles[i]) { if (free_slot < 0) free_slot = i; continue; }
+        if (nr_gchandle_target(p->handles[i]) == d) { LeaveCriticalSection(&rev_lock); return p->fns[i]; }
+    }
+    if (free_slot < 0) { LeaveCriticalSection(&rev_lock); nr_throw_notsupported("delegate thunk pool exhausted"); }
+    p->handles[free_slot] = nr_gchandle_new(d, 0);
+    LeaveCriticalSection(&rev_lock);
+    return p->fns[free_slot];
+}
+
+/* Entry from native code into a bound delegate: the thread may be new to us. */
+void* nr_reverse_enter(uint32_t h)
+{
+    nr_current_thread_object();
+    return nr_gchandle_target(h);
 }
 
 /* ---- finalizers ---- */
@@ -591,12 +634,28 @@ void* nr_icall(const char* full, const char* name)
 
 static void missing_entry(void) { nr_throw_new("System", "EntryPointNotFoundException", "P/Invoke entry point not found"); }
 
-void* nr_pinvoke(const char* lib, const char* entry)
+static void* find_export(HMODULE h, const char* entry)
+{
+    char name[600];
+    void* f = (void*)GetProcAddress(h, entry);
+    /* stdcall decoration: _name@N */
+    for (int n = 0; n <= 64 && !f; n += 4)
+    {
+        _snprintf(name, sizeof name, "_%s@%d", entry, n);
+        name[sizeof name - 1] = 0;
+        f = (void*)GetProcAddress(h, name);
+    }
+    return f;
+}
+
+/* Library lookup order: the module itself for __Internal, then LoadLibrary
+ * (with and without .dll), and only then the host's plugin hooks, which in a
+ * Unity player log every miss. */
+void* nr_pinvoke(const char* lib, const char* entry, const char* alt)
 {
     HMODULE h = 0;
     char path[MAX_PATH * 2];
     if (!strcmp(lib, "__Internal")) h = GetModuleHandleA(0);
-    if (!h && nr_find_plugin) { path[0] = 0; nr_find_plugin(lib, path, sizeof path); if (path[0]) h = LoadLibraryA(path); }
     if (!h) h = LoadLibraryA(lib);
     if (!h)
     {
@@ -604,15 +663,16 @@ void* nr_pinvoke(const char* lib, const char* entry)
         path[sizeof path - 1] = 0;
         h = LoadLibraryA(path);
     }
-    void* f = h ? (void*)GetProcAddress(h, entry) : 0;
-    if (h && !f)
+    void* f = 0;
+    if (h)
     {
-        /* stdcall decoration: _name@N */
-        for (int n = 0; n <= 64 && !f; n += 4)
-        {
-            _snprintf(path, sizeof path, "_%s@%d", entry, n);
-            f = (void*)GetProcAddress(h, path);
-        }
+        f = find_export(h, entry);
+        if (!f && alt) f = find_export(h, alt);
+    }
+    if (!f && nr_pinvoke_hook)
+    {
+        f = nr_pinvoke_hook(lib, entry);
+        if (!f && alt) f = nr_pinvoke_hook(lib, alt);
     }
     if (!f)
     {
@@ -735,7 +795,7 @@ int nr_type_byref(void* t)
 {
     const NrFieldDesc* f = nr_field(nr_k_monotype, "_impl");
     NrType* ty = *(NrType**)((char*)t + f->offset);
-    return ty ? ty->byref : 0;
+    return ty ? NR_TYPE_BYREF(ty) : 0;
 }
 
 /* ---- reflection invoke ---- */
@@ -803,8 +863,8 @@ static void add_module_roots(HMODULE mod)
         }
 }
 
-extern IMAGE_DOS_HEADER __ImageBase;
 void nr_register_corlib_icalls(void);
+int nr_debug(void);
 
 static NrClass* need(const char* ns, const char* name)
 {
@@ -818,12 +878,14 @@ void nr_init(void)
     static int done;
     if (done) return;
     done = 1;
+    nr_debug();
     InitializeCriticalSection(&arr_lock);
     InitializeCriticalSection(&str_lock);
     InitializeCriticalSection(&cctor_lock);
     InitializeCriticalSection(&ic_lock);
     InitializeCriticalSection(&gch_lock);
     InitializeCriticalSection(&type_lock);
+    InitializeCriticalSection(&rev_lock);
     GC_set_no_dls(1);
     GC_set_finalize_on_demand(1);
     GC_INIT();
@@ -869,6 +931,58 @@ void nr_init(void)
 
 static int dbg_on = -1;
 static CRITICAL_SECTION dbg_lock;
+void nr_print_addr(void* addr);
+
+/* "module+offset" for an address: what llvm-objdump --start-address wants. */
+static void mod_off(void* a, char* out, size_t n)
+{
+    HMODULE m = 0;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m))
+        GetModuleFileNameA(m, path, MAX_PATH);
+    const char* b = strrchr(path, '\\');
+    _snprintf(out, n, "%s+0x%x", b ? b + 1 : path, (unsigned)((uintptr_t)a - (uintptr_t)m));
+    out[n - 1] = 0;
+}
+
+/* Faults outside the runtime's own code (the engine, a driver) with registers
+ * and every stack word that points into a module. Managed null references
+ * fault inside mono.dll and are expected; those only get a line. */
+static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
+{
+    static volatile LONG count;
+    EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
+        && r->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && r->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+    HMODULE self = (HMODULE)&__ImageBase, at = 0;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r->ExceptionAddress, &at);
+    if (at == self) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&count) > 8) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    char where[300];
+    mod_off(r->ExceptionAddress, where, sizeof where);
+    nr_log("netrecomp: fault 0x%08lx at %s (data %p) thread %lu\n", r->ExceptionCode, where,
+           r->NumberParameters > 1 ? (void*)r->ExceptionInformation[1] : 0, GetCurrentThreadId());
+    nr_log("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx ebp=%08lx esp=%08lx\n",
+           c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    uintptr_t* sp = (uintptr_t*)c->Esp;
+    for (int i = 0; i < 400; i++)
+    {
+        uintptr_t v;
+        if (IsBadReadPtr(sp + i, 4)) break;
+        v = sp[i];
+        HMODULE m = 0;
+        if (v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)v, &m) && m)
+        {
+            char buf[300];
+            mod_off((void*)v, buf, sizeof buf);
+            nr_log("  [esp+%03x] %s\n", i * 4, buf);
+            if (m == self) nr_print_addr((void*)v);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int nr_debug(void)
 {
     if (dbg_on < 0)
@@ -879,6 +993,7 @@ int nr_debug(void)
             InitializeCriticalSection(&dbg_lock);
             SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
             SymInitialize(GetCurrentProcess(), 0, TRUE);
+            AddVectoredExceptionHandler(1, fault_veh);
         }
     }
     return dbg_on;
@@ -949,4 +1064,55 @@ void nr_async_callback(void* cb)
     void* args[1] = { 0 };
     void* ex = 0;
     if (inv) nr_invoke(inv, cb, args, &ex);
+}
+
+/* ---- native calls whatever their convention ----
+ * Copies n dwords of arguments to the stack, calls fn, and restores the stack
+ * pointer from the frame, so a cdecl callee (which leaves its arguments) and
+ * a stdcall one (which pops them) both come back right. The integer result is
+ * edx:eax; the _fp variant returns the x87 st(0) the callee left. */
+__declspec(naked) int64_t nr_native_call(void* fn, const uint32_t* args, int32_t n)
+{
+    __asm {
+        push ebp
+        mov ebp, esp
+        push esi
+        push edi
+        mov ecx, [ebp + 16]
+        mov esi, [ebp + 12]
+        lea eax, [ecx * 4]
+        sub esp, eax
+        mov edi, esp
+        cld
+        rep movsd
+        call dword ptr [ebp + 8]
+        lea esp, [ebp - 8]
+        pop edi
+        pop esi
+        pop ebp
+        ret
+    }
+}
+
+__declspec(naked) double nr_native_call_fp(void* fn, const uint32_t* args, int32_t n)
+{
+    __asm {
+        push ebp
+        mov ebp, esp
+        push esi
+        push edi
+        mov ecx, [ebp + 16]
+        mov esi, [ebp + 12]
+        lea eax, [ecx * 4]
+        sub esp, eax
+        mov edi, esp
+        cld
+        rep movsd
+        call dword ptr [ebp + 8]
+        lea esp, [ebp - 8]
+        pop edi
+        pop esi
+        pop ebp
+        ret
+    }
 }

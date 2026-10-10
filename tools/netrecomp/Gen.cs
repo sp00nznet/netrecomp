@@ -382,7 +382,7 @@ sealed class Gen
             else if (t.K == TK.SzArray && Blittable(t.Elem)) { nparams.Add("void*"); nargs.Add($"({a} ? NR_ADATA({a}) : 0)"); }
             else if (t.K == TK.ByRef && Blittable(t.Elem)) { nparams.Add("void*"); nargs.Add(a); }
             else if (Blittable(t)) { nparams.Add(Lay.C(t)); nargs.Add(a); }
-            else if (IsDelegate(t)) { nparams.Add("void*"); nargs.Add($"nr_delegate_to_fnptr({a})"); }
+            else if (IsDelegate(t)) { RevPool(t); nparams.Add("void*"); nargs.Add($"nr_delegate_to_fnptr({a})"); }
             else throw new EmitError("pinvoke param " + t.Key);
         }
         var rt = W.RetType(m);
@@ -396,14 +396,38 @@ sealed class Gen
         else if (rt.K == TK.Def && rt.Def.FullName == "System.String") { nrt = unicode ? "const uint16_t*" : "const char*"; conv = unicode ? "nr_str_from_utf16z(r)" : "nr_str_from_utf8(r)"; }
         else if (Blittable(rt)) { nrt = Lay.C(rt); conv = "r"; }
         else throw new EmitError("pinvoke return " + rt.Key);
+        // The call goes through nr_native_call, which copies the arguments to the
+        // stack and restores the stack pointer afterwards: native libraries often
+        // export cdecl functions that DllImport declares stdcall (the default),
+        // and mono's frames tolerated the mismatch. (cc is therefore unused.)
+        _ = cc;
         var sb = new StringBuilder();
         sb.Append(Proto(m)).Append("\n{\n");
-        sb.Append($"    static {nrt} ({cc} *fn)({string.Join(", ", nparams.DefaultIfEmpty("void"))});\n");
-        sb.Append($"    if (!fn) *(void**)&fn = nr_pinvoke(\"{CEsc(lib)}\", \"{CEsc(entry)}\");\n");
+        sb.Append("    static void* fn;\n");
+        // Without ExactSpelling, mono also tries the A/W-suffixed export (GetModuleHandle -> GetModuleHandleA).
+        var alt = pi.IsNoMangle ? "0" : $"\"{CEsc(entry + (unicode ? "W" : "A"))}\"";
+        sb.Append($"    if (!fn) fn = nr_pinvoke(\"{CEsc(lib)}\", \"{CEsc(entry)}\", {alt});\n");
         sb.Append(pre);
-        var call = $"fn({string.Join(", ", nargs)})";
-        if (nrt == "void") sb.Append($"    {call};\n").Append(post);
-        else sb.Append($"    {nrt} r = {call};\n").Append(post).Append($"    return {conv};\n");
+        sb.Append($"    uint32_t pv[{Math.Max(1, nparams.Count * 4 + 4)}]; int32_t pn = 0;\n");
+        for (int i = 0; i < nparams.Count; i++)
+        {
+            var c = nparams[i];
+            // narrower than a stack slot: widen, the way the caller pushes it
+            var slot = c is "uint8_t" or "int8_t" or "int16_t" or "uint16_t" ? "int32_t" : c;
+            var cast = System.Text.RegularExpressions.Regex.IsMatch(slot, @"^T[0-9]+$") ? "" : $"({slot})";
+            sb.Append($"    {{ {slot} v = {cast}{nargs[i]}; memcpy(&pv[pn], &v, sizeof v); pn += (int32_t)((sizeof v + 3) / 4); }}\n");
+        }
+        bool fp = nrt is "float" or "double";
+        if (nrt == "void") sb.Append("    nr_native_call(fn, pv, pn);\n").Append(post);
+        else
+        {
+            if (fp) sb.Append($"    {nrt} r = ({nrt})nr_native_call_fp(fn, pv, pn);\n");
+            else if (nrt.EndsWith("*")) sb.Append($"    {nrt} r = ({nrt})(intptr_t)nr_native_call(fn, pv, pn);\n");
+            else if (Lay.Kind(rt) == SK.VT && !rt.IsEnum && !Layouts.IsPrim(rt))
+                sb.Append($"    {nrt} r; {{ int64_t rr = nr_native_call(fn, pv, pn); memcpy(&r, &rr, sizeof r < 8 ? sizeof r : 8); }}\n");
+            else sb.Append($"    {nrt} r = ({nrt})nr_native_call(fn, pv, pn);\n");
+            sb.Append(post).Append($"    return {conv};\n");
+        }
         sb.Append("}\n");
         return sb.ToString();
     }
@@ -563,6 +587,52 @@ sealed class Gen
     public IReadOnlyList<TT> ConstructedList => constructedList;
     public HashSet<MI> Thunks => thunks;
     public HashSet<MI> Descs => descs;
+
+    // ---- reverse P/Invoke ----
+    // A delegate handed to native code needs a real function pointer. Each such
+    // delegate type gets a pool of native-callable thunks; a slot is bound to one
+    // delegate instance through a GC handle (nr_delegate_to_fnptr).
+    public const int RevPoolSize = 32;
+    public readonly Dictionary<TT, string> RevPools = new();
+    void RevPool(TT d)
+    {
+        if (RevPools.ContainsKey(d)) return;
+        Klass(d);
+        var inv = W.Method(d, d.Def.Methods.First(x => x.Name == "Invoke"), Array.Empty<TT>());
+        Need(inv);
+        RevPools[d] = "";
+    }
+
+    public string RevPoolCode(TT d)
+    {
+        var inv = W.Method(d, d.Def.Methods.First(x => x.Name == "Invoke"), Array.Empty<TT>());
+        var ca = d.Def.CustomAttributes.FirstOrDefault(c => c.AttributeType.Name == "UnmanagedFunctionPointerAttribute");
+        var cc = ca != null && ca.ConstructorArguments.Count > 0 && Convert.ToInt32(ca.ConstructorArguments[0].Value) == 2 ? "__cdecl" : "__stdcall";
+        var id = d.Id;
+        var nps = new List<string>(); var conv = new List<string>();
+        for (int i = 0; i < inv.Def.Parameters.Count; i++)
+        {
+            var pt = W.ParamType(inv, i);
+            if (pt.K == TK.Def && pt.Def.FullName == "System.String") { nps.Add("const char*"); conv.Add($"nr_str_from_utf8(a{i})"); }
+            else if (pt.K == TK.Def && pt.Def.FullName == "System.Boolean") { nps.Add("int32_t"); conv.Add($"(uint8_t)(a{i} != 0)"); }
+            else if (pt.K == TK.ByRef || Blittable(pt)) { nps.Add(pt.K == TK.ByRef ? "void*" : Lay.C(pt)); conv.Add($"a{i}"); }
+            else throw new EmitError("reverse P/Invoke parameter " + pt.Key);
+        }
+        var rt = W.RetType(inv);
+        string nrt = Layouts.IsVoid(rt) ? "void" : rt.K == TK.Def && rt.Def.FullName == "System.Boolean" ? "int32_t" : Lay.C(rt);
+        var ps = string.Join(", ", nps.Select((c, i) => $"{c} a{i}"));
+        var args = string.Join(", ", nps.Select((_, i) => $"a{i}"));
+        var call = $"{NameOf(inv)}({string.Join(", ", conv.Prepend("d"))})";
+        var sb = new StringBuilder();
+        sb.Append($"static uint32_t RH{id}[{RevPoolSize}];\n");
+        sb.Append($"static {nrt} RV{id}(uint32_t h{(ps.Length > 0 ? ", " + ps : "")})\n{{\n    void* d = nr_reverse_enter(h);\n");
+        sb.Append(nrt == "void" ? $"    {call};\n}}\n" : $"    return ({nrt}){call};\n}}\n");
+        for (int k = 0; k < RevPoolSize; k++)
+            sb.Append($"static {nrt} {cc} RT{id}_{k}({(ps.Length > 0 ? ps : "void")}) {{ {(nrt == "void" ? "" : "return ")}RV{id}(RH{id}[{k}]{(args.Length > 0 ? ", " + args : "")}); }}\n");
+        sb.Append($"static void* const RF{id}[] = {{ {string.Join(", ", Enumerable.Range(0, RevPoolSize).Select(k => $"(void*)RT{id}_{k}"))} }};\n");
+        sb.Append($"static const NrRevPool RP{id} = {{ RH{id}, RF{id}, {RevPoolSize} }};\n");
+        return sb.ToString();
+    }
     public IEnumerable<(FI f, int id)> FieldHandles => fhandles.Values;
     public HashSet<FI> Rvas => rvas;
     public bool IsReached(MI m) => reached.Contains(m);

@@ -76,10 +76,9 @@ static void* field_object(const NrFieldDesc* f)
 }
 
 /* Properties are synthesized from get_X / set_X special-name methods. */
-typedef struct NrProp { NrClass* klass; const char* name; const NrMethodDesc *get, *set; } NrProp;
 typedef struct PropList { NrClass* k; NrProp* p; int n; struct PropList* next; } PropList;
 static PropList* props;
-static const NrProp* props_of(NrClass* k, int* n)
+const NrProp* nr_props_of(NrClass* k, int* n)
 {
     EnterCriticalSection(&cache_lock);
     for (PropList* l = props; l; l = l->next) if (l->k == k) { *n = l->n; LeaveCriticalSection(&cache_lock); return l->p; }
@@ -341,7 +340,7 @@ static void* MonoType_GetPropertiesByName(void* self, void* name, int32_t bf, ui
     void* tmp[512]; int n = 0;
     for (NrClass* c = k; c && n < 512; c = (bf & 2) ? 0 : c->parent)
     {
-        int np; const NrProp* ps = props_of(c, &np);
+        int np; const NrProp* ps = nr_props_of(c, &np);
         for (int i = 0; i < np && n < 512; i++)
         {
             if (!bind_ok(prop_attrs(&ps[i]), bf, c != k) || !name_eq(ps[i].name, name, ic)) continue;
@@ -730,6 +729,13 @@ static void* Assembly_GetReferencedAssemblies(void* self) { (void)self; return n
 static void* Assembly_InternalImageRuntimeVersion(void* self) { (void)self; return nr_str_utf8("v2.0.50727"); }
 static int32_t MemberInfo_get_MetadataToken(void* self) { (void)self; return 0; }
 static void* StackTrace_get_trace(void* exc, int32_t skip, uint8_t need_file) { (void)exc; (void)skip; (void)need_file; return new_array(nr_class_by_name("System.Diagnostics", "StackFrame"), 0); }
+/* No managed frame records: report that there's no frame. */
+static uint8_t StackFrame_get_frame_info(int32_t skip, uint8_t need_file, void** method, int32_t* il, int32_t* native, void** file, int32_t* line, int32_t* col)
+{
+    (void)skip; (void)need_file;
+    *method = 0; *il = 0; *native = 0; *file = 0; *line = 0; *col = 0;
+    return 0;
+}
 static void* Delegate_CreateDelegate_internal(void* type, void* target, void* mi, uint8_t throw_err)
 {
     (void)throw_err;
@@ -850,6 +856,7 @@ void nr_register_reflect_icalls(void)
         { "System.AppDomain::GetAssemblies", AppDomain_GetAssemblies },
         { "System.Reflection.MemberInfo::get_MetadataToken", MemberInfo_get_MetadataToken },
         { "System.Diagnostics.StackTrace::get_trace", StackTrace_get_trace },
+        { "System.Diagnostics.StackFrame::get_frame_info", StackFrame_get_frame_info },
         { "System.Delegate::CreateDelegate_internal", Delegate_CreateDelegate_internal },
         { "System.Delegate::SetMulticastInvoke", Delegate_SetMulticastInvoke },
     };

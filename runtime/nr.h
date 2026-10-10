@@ -30,10 +30,22 @@ typedef struct NrDelegate {
     void* prev; void* kpm_next;
 } NrDelegate;
 
-/* MonoType stand-in: what a RuntimeTypeHandle holds. */
-typedef struct NrType { NrClass* klass; uint8_t byref; uint8_t type; } NrType;
+/* MonoType, laid out as mono's (Unity reads it directly): data is the class
+ * for classes and value types, the element class for T[], a MonoArrayType for
+ * T[,], a MonoGenericClass for generic instances, and the element MonoType for
+ * pointers. bits: num_mods:6, byref:1 (0x40), pinned:1. klass is ours. */
+typedef struct NrType { void* data; uint16_t attrs; uint8_t type; uint8_t bits; NrClass* klass; } NrType;
+#define NR_TYPE_BYREF(t) (((t)->bits & 0x40) != 0)
+/* what MonoType.data points at for T[,] and generic instances (mono 2.x layouts) */
+typedef struct NrMonoArrayType { NrClass* eklass; uint8_t rank, numsizes, numlobounds; int* sizes; int* lobounds; } NrMonoArrayType;
+typedef struct NrMonoGenericClass { NrClass* container_class; void* class_inst; void* method_inst; uint32_t flags; NrClass* cached_class; } NrMonoGenericClass;
 typedef struct NrIface { NrClass* iface; int32_t offset; } NrIface;
-typedef struct NrImage { const char* name; const char* file; void* assembly_obj; void* reserved; } NrImage;
+/* One per assembly. sha256 is the file the code was generated from: the mono
+ * host checks it against what the game actually loads. */
+typedef struct NrImage {
+    const char* name; const char* file; void* assembly_obj; void* reserved;
+    int32_t n_typedefs; const char* fullname; const char* sha256;
+} NrImage;
 
 typedef struct NrFieldDesc {
     const char* name; NrClass* type; NrClass* parent;
@@ -84,7 +96,11 @@ struct NrClass {
     NrClass* szarray;         /* T[] when generated */
     void* rt;                 /* runtime-private */
     const NrAttr* cattrs; uint16_t n_cattrs;
+    const struct NrRevPool* rev_pool;   /* delegates handed to native code */
 };
+
+typedef struct NrRevPool { uint32_t* handles; void* const* fns; int32_t n; } NrRevPool;
+void* nr_reverse_enter(uint32_t handle);
 
 typedef struct NrStrLit { const uint16_t* chars; int32_t len; } NrStrLit;
 typedef struct NrGvmEntry { NrClass* klass; void* fn; } NrGvmEntry;
@@ -118,7 +134,9 @@ void  nr_delegate_init(void* d, void* target, void* fn, const NrMethodDesc* m);
 void* nr_delegate_to_fnptr(void* d);
 NrType* nr_class_type(NrClass* k);
 void* nr_icall(const char* full, const char* name);
-void* nr_pinvoke(const char* lib, const char* entry);
+void* nr_pinvoke(const char* lib, const char* entry, const char* alt);
+int64_t nr_native_call(void* fn, const uint32_t* args, int32_t n);
+double nr_native_call_fp(void* fn, const uint32_t* args, int32_t n);
 char* nr_str_to_utf8(void* s);
 const uint16_t* nr_str_chars(void* s);
 void* nr_str_from_utf8(const char* s);

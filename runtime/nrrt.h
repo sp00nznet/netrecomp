@@ -66,6 +66,13 @@ uint32_t nr_gchandle_new_weak(void* o);
 void* nr_gchandle_target(uint32_t h);
 void nr_gchandle_free(uint32_t h);
 
-extern void (*nr_find_plugin)(const char* name, char* out, int outsize);
+/* hooks the Unity host sets: plugin lookup for P/Invoke, unhandled exceptions */
+extern void* (*nr_pinvoke_hook)(const char* lib, const char* entry);
+extern void (*nr_unhandled_hook)(void* exc);
+
+typedef struct NrProp { NrClass* klass; const char* name; const NrMethodDesc *get, *set; } NrProp;
+const NrProp* nr_props_of(NrClass* k, int* n);
+void* nr_method_object(const NrMethodDesc* m);
+void* nr_assembly_object(NrImage* img);
 extern int nr_log_missing;
 void nr_log(const char* fmt, ...);

@@ -40,6 +40,9 @@ static class Program
         "System.IO.DirectoryNotFoundException", "System.IO.EndOfStreamException", "System.UnauthorizedAccessException",
         "System.Security.SecurityException", "System.FormatException", "System.Collections.Generic.KeyNotFoundException",
         "System.AppDomain", "System.Int32", "System.Boolean", "System.Byte", "System.Char", "System.Int64",
+        "System.EntryPointNotFoundException", "System.Threading.SynchronizationLockException",
+        "System.Reflection.TargetParameterCountException", "System.Reflection.TargetException",
+        "System.Reflection.AmbiguousMatchException", "System.ObjectDisposedException", "System.TimeoutException",
         "System.Single", "System.Double", "System.IntPtr", "System.Int16", "System.UInt16", "System.UInt32",
         "System.UInt64", "System.SByte", "System.UIntPtr", "System.Void", "System.DBNull", "System.Reflection.Missing",
     };
@@ -107,6 +110,7 @@ static class Program
         {
             if (t.HasGenericParameters || IsOpenNested(t)) continue;
             var tt = w.Inst(t, none);
+            g.Klass(tt);   // a class record even for static classes: Unity enumerates by token
             if (!t.IsInterface && !t.IsAbstract) g.Construct(tt);
             foreach (var m in t.Methods)
                 if (!m.HasGenericParameters && !m.IsAbstract) g.Root(w.Method(tt, m, none));

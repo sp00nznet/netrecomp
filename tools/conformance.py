@@ -85,7 +85,7 @@ def main():
     if a.update_baseline:
         json.dump({"passed": passed, "total": len(tests), "results": results}, open(base_file, "w"), indent=2)
         print("baseline updated")
-    elif passed < base.get("passed", 0):
+    elif not a.only and passed < base.get("passed", 0):
         print(f"REGRESSION: {passed} < baseline {base['passed']}")
         return 1
     return 0
