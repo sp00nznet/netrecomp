@@ -1,0 +1,33 @@
+# --- Game data and anything derived from it: never committed (REPO_RULES section 3) ---
+game/
+gen/
+gen_*/
+generated/
+scratch/
+work/
+decomp/
+*.expected
+*.actual
+
+# --- Fetched third-party sources ---
+deps/
+
+# --- Build output ---
+bin/
+build/
+obj/
+*.exe
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.mp4
+
+# --- Editor / OS ---
+.vs/
+.vscode/
+__pycache__/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,23 @@
+netrecomp
+Copyright (c) 2026 sp00nz. MIT licensed, see LICENSE.
+
+No third-party code is stored in this repository.
+
+Linked into every build, fetched by tools/fetch_deps.py (pinned by SHA-256):
+
+deps/gc-8.2.8/  (built from extra/gc.c only)
+    Boehm-Demers-Weiser conservative garbage collector, v8.2.8.
+    https://github.com/ivmai/bdwgc
+    Permissive X11-style licence; the notice is in LICENSES/bdwgc.txt and
+    must ship with any build.
+
+Used by the translator, restored from NuGet:
+
+Mono.Cecil 0.11.6
+    https://github.com/jbevain/cecil  MIT licence.
+
+Where the runtime's knowledge comes from: the internal-call signatures and the
+object layouts the runtime implements are read from the managed class library
+being compiled (Mono's 2.x class libraries, which a game ships; MIT licensed)
+and from mono's public embedding API names that Unity's player looks up.
+No Mono runtime source was used.

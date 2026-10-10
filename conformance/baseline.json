@@ -1,0 +1,9 @@
+{
+  "passed": 3,
+  "total": 3,
+  "results": {
+    "basics": "PASS",
+    "collections": "PASS",
+    "runtime": "PASS"
+  }
+}
