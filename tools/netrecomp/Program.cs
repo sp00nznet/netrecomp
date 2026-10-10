@@ -43,6 +43,7 @@ static class Program
         "System.EntryPointNotFoundException", "System.Threading.SynchronizationLockException",
         "System.Reflection.TargetParameterCountException", "System.Reflection.TargetException",
         "System.Reflection.AmbiguousMatchException", "System.ObjectDisposedException", "System.TimeoutException",
+        "System.Security.Cryptography.RNGCryptoServiceProvider",   // CryptoConfig creates it by name (Guid.NewGuid)
         "System.Single", "System.Double", "System.IntPtr", "System.Int16", "System.UInt16", "System.UInt32",
         "System.UInt64", "System.SByte", "System.UIntPtr", "System.Void", "System.DBNull", "System.Reflection.Missing",
     };
@@ -115,9 +116,11 @@ static class Program
             foreach (var m in t.Methods)
                 if (!m.HasGenericParameters && !m.IsAbstract) g.Root(w.Method(tt, m, none));
             // Unity's serializer creates field values like List<T> through their default ctor
-            foreach (var f in t.Fields.Where(f => !f.IsStatic))
+            // inherited fields count too: they come from generic bases like Machine<TState>
+            for (var bt = tt; bt != null && bt.K == TK.Def; bt = w.BaseOf(bt))
+            foreach (var f in bt.Def.Fields.Where(f => !f.IsStatic))
             {
-                var ft = w.FieldType(tt, f);
+                var ft = w.FieldType(bt, f);
                 if (ft.K != TK.Def || !ft.IsGenericInst || ft.IsValueType || ft.IsInterface || ft.Def.IsAbstract) continue;
                 g.Construct(ft);
                 foreach (var c in ft.Def.Methods.Where(c => c.IsConstructor && !c.IsStatic && c.Parameters.Count == 0))

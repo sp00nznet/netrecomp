@@ -35,10 +35,20 @@ field by value. The conformance tests lift 100%.
   `s1v17`), so nothing moves at branches. Kinds: I4, I8, R4, R8, native int, pointer/object,
   value type. A join where paths push a native int and a pointer (a `fixed` statement)
   settles on native int, and each edge into it converts (`EdgeMoves`).
-- **Exceptions** are Win32 SEH: `__try/__except` for catch (one filter for all clauses of a
-  try), `__try/__finally` for finally. `leave` is a `goto` out of the `__try`, which runs the
-  finally blocks exactly as the CLI does. A label on a try's first instruction is placed
-  outside the `__try`, because C can't jump into one.
+- **Exceptions** are Win32 SEH with no `__finally` and no filter writing to a local. Clang
+  outlines x86 filters and `__finally` blocks, and in a function that realigns its stack
+  (clang does that for SSE spills) the outlined code addresses the parent's locals through
+  a stale base pointer: Shadowrun's `createSharedPortraitAtlases` overwrote its own return
+  address that way. So:
+  - catch: one `__except` for all clauses of a try; the filter (`nr_catch_any` with null
+    outs) parks the match per thread and the handler body takes it with `nr_caught`.
+  - finally: a catch-all `__except` that only records the exception, then the finally body
+    inline after it (both paths), then `if (ex) nr_throw(ex)`.
+  - `leave` out of such a try sets `lv<off>` and jumps to an exit label at the end of the
+    `__try`; after the finally body a `switch` continues to the target, repeating at each
+    enclosing try.
+  A label on a try's first instruction is placed outside the `__try`, because C can't jump
+  into one.
 - **Null references and integer division by zero** are hardware faults that the catch filter
   turns into managed exceptions (as mono did). Two compiler flags make that true in C; see
   [Build notes](#build-notes).

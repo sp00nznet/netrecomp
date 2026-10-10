@@ -72,7 +72,8 @@ static void ensure_init(void)
 /* ---- runtime set-up: mostly accepted and ignored ---- */
 
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); return &root_domain; }
+void nr_input_start(void);
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
@@ -133,7 +134,12 @@ void* nr_pinvoke_fallback(const char* lib, const char* entry)
 }
 
 /* Unity's engine calls, by "Namespace.Type::Method" */
-API void mono_add_internal_call(const char* name, const void* fn) { TR("mono_add_internal_call"); ensure_init(); nr_add_icall(name, fn); }
+API void mono_add_internal_call(const char* name, const void* fn)
+{
+    TR("mono_add_internal_call");
+    if (trace_on > 0) nr_log("[mono]   icall %s = exe+0x%x\n", name, (unsigned)((const char*)fn - (const char*)GetModuleHandleA(0)));
+    ensure_init(); nr_add_icall(name, fn);
+}
 
 /* ---- domains ---- */
 

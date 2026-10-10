@@ -384,12 +384,32 @@ void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
     return last_obj;
 }
 
+/* Generated filters pass null out-pointers: clang outlines x86 filters, and in
+ * a function that realigns its stack a filter computes the parent's locals at
+ * the wrong address. The filter's verdict waits here instead (a GC root slot
+ * per thread) for the handler body, which runs in the parent frame, to take
+ * with nr_caught. */
+static __declspec(thread) void** caught_slot;
+static __declspec(thread) int32_t caught_which;
+static void stash(void* o, int32_t which)
+{
+    if (!caught_slot) caught_slot = (void**)GC_MALLOC_UNCOLLECTABLE(sizeof(void*));
+    *caught_slot = o; caught_which = which;
+}
+void* nr_caught(int32_t* which)
+{
+    void* o = *caught_slot;
+    *caught_slot = 0;
+    if (which) *which = caught_which;
+    return o;
+}
+
 int nr_catch(struct _EXCEPTION_POINTERS* ep, NrClass* k, void** ex)
 {
     void* o = nr_current_exception_object(ep);
     if (!o) return EXCEPTION_CONTINUE_SEARCH;
     if (k && !nr_isinst(o, k)) return EXCEPTION_CONTINUE_SEARCH;
-    *ex = o;
+    if (ex) *ex = o; else stash(o, 0);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -398,7 +418,11 @@ int nr_catch_any(struct _EXCEPTION_POINTERS* ep, NrClass* const* ks, int n, void
     void* o = nr_current_exception_object(ep);
     if (!o) return EXCEPTION_CONTINUE_SEARCH;
     for (int i = 0; i < n; i++)
-        if (nr_isinst(o, ks[i])) { *ex = o; *which = i; return EXCEPTION_EXECUTE_HANDLER; }
+        if (nr_isinst(o, ks[i]))
+        {
+            if (ex) { *ex = o; *which = i; } else stash(o, i);
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -617,6 +641,9 @@ static void missing_icall(void)
     nr_throw_new("System", "MissingMethodException", msg);
 }
 
+int nr_trace_icalls;
+void nr_icall_trace(const char* name) { nr_log("[icall] %s\n", name); }
+
 void* nr_icall(const char* full, const char* name)
 {
     const void* f = ic_find(full);
@@ -824,7 +851,10 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
     if (!m->fn || !m->invoke)
     {
         char msg[512];
-        snprintf(msg, sizeof msg, "%s.%s::%s (not compiled)", m->klass->ns, m->klass->name, m->name);
+        int n = snprintf(msg, sizeof msg, "%s.%s", m->klass->ns, m->klass->name);
+        for (int i = 0; i < m->klass->n_gargs && n < (int)sizeof msg - 64; i++)
+            n += snprintf(msg + n, sizeof msg - n, "%s%s.%s", i ? "," : "<", m->klass->gargs[i]->ns, m->klass->gargs[i]->name);
+        snprintf(msg + n, sizeof msg - n, "%s::%s (not compiled)", m->klass->n_gargs ? ">" : "", m->name);
         void* e = nr_exception(nr_class_by_name("System", "MissingMethodException"), msg);
         if (exc) { *exc = e; return 0; }
         nr_throw(e);
@@ -891,6 +921,7 @@ void nr_init(void)
     GC_set_no_dls(1);
     GC_set_finalize_on_demand(1);
     GC_INIT();
+    nr_trace_icalls = GetEnvironmentVariableA("NR_TRACE_ICALLS", 0, 0) > 0;
     GC_allow_register_threads();
     add_module_roots((HMODULE)&__ImageBase);
     fin_event = CreateEventA(0, FALSE, FALSE, 0);
@@ -950,10 +981,48 @@ static void mod_off(void* a, char* out, size_t n)
 /* Faults outside the runtime's own code (the engine, a driver) with registers
  * and every stack word that points into a module. Managed null references
  * fault inside mono.dll and are expected; those only get a line. */
+/* Debug aid: nr_debug_watch(addr) arms a hardware write watchpoint (DR0, 4 bytes)
+ * on the calling thread; fault_veh reports each write with the writer's stack.
+ * Debug registers can't be set on the running thread, so a helper thread
+ * suspends this one, sets them and resumes it. */
+static void* watch_addr;
+static DWORD WINAPI watch_set(void* th)
+{
+    CONTEXT c = { 0 };
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    SuspendThread(th);
+    GetThreadContext(th, &c);
+    c.Dr0 = (DWORD)(uintptr_t)watch_addr;
+    c.Dr7 = (c.Dr7 & ~0xF0003u) | 1u | (1u << 16) | (3u << 18);   /* L0, write, 4 bytes */
+    SetThreadContext(th, &c);
+    ResumeThread(th);
+    return 0;
+}
+void nr_debug_watch(void* addr)
+{
+    HANDLE self;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, THREAD_ALL_ACCESS, FALSE, 0);
+    watch_addr = addr;
+    HANDLE h = CreateThread(0, 0, watch_set, self, 0, 0);
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h); CloseHandle(self);
+    nr_log("netrecomp: watching writes to %p\n", addr);
+}
+
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
 {
     static volatile LONG count;
     EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && watch_addr && (ep->ContextRecord->Dr6 & 1))
+    {
+        char where[300];
+        mod_off(r->ExceptionAddress, where, sizeof where);
+        nr_log("netrecomp: watch %p now %08lx, written by %s\n", watch_addr, (unsigned long)*(uintptr_t*)watch_addr, where);
+        nr_print_addr(r->ExceptionAddress);
+        nr_print_stack(0);
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
         && r->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && r->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
     HMODULE self = (HMODULE)&__ImageBase, at = 0;
@@ -968,6 +1037,32 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
     nr_log("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx ebp=%08lx esp=%08lx\n",
            c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
     uintptr_t* sp = (uintptr_t*)c->Esp;
+    if (!IsBadReadPtr(sp, 16)) nr_log("  [esp] %08lx %08lx %08lx %08lx\n", (unsigned long)sp[0], (unsigned long)sp[1], (unsigned long)sp[2], (unsigned long)sp[3]);
+    /* the words around esp, each named: module+offset or GC object class */
+    for (int i = -16; i < 48; i++)
+    {
+        uintptr_t* w = sp + i;
+        if (IsBadReadPtr(w, 4)) continue;
+        void* v = (void*)*w;
+        char buf[300] = "";
+        HMODULE m = 0;
+        if ((uintptr_t)v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)v, &m) && m) mod_off(v, buf, sizeof buf);
+        else if ((uintptr_t)v > 0x10000 && GC_base(v) == v && !IsBadReadPtr(v, 4) && *(NrClass**)v && !IsBadReadPtr(*(NrClass**)v, sizeof(NrClass)) && (*(NrClass**)v)->self == *(NrClass**)v)
+            _snprintf(buf, sizeof buf, "obj %s", (*(NrClass**)v)->name);
+        nr_log("  %c%+04x %08lx %s\n", i ? ' ' : '>', i * 4, (unsigned long)*w, buf);
+    }
+    /* where an address outside every module lives: GC object (and class) or which region */
+    void* probe[2] = { r->ExceptionAddress, IsBadReadPtr(sp, 4) ? 0 : (void*)sp[0] };
+    for (int i = 0; i < 2; i++)
+    {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!probe[i] || !VirtualQuery(probe[i], &mi, sizeof mi)) continue;
+        void* b = GC_base(probe[i]);
+        NrClass* bk = b && !IsBadReadPtr(b, 4) ? *(NrClass**)b : 0;
+        nr_log("  %p: region %p+%lx type %lx protect %lx state %lx; gc object %p (+%lx) %s\n", probe[i], mi.AllocationBase,
+               (unsigned long)((char*)probe[i] - (char*)mi.AllocationBase), mi.Type, mi.Protect, mi.State, b,
+               b ? (unsigned long)((char*)probe[i] - (char*)b) : 0, bk && !IsBadReadPtr(bk, sizeof(NrClass)) && bk->self == bk ? bk->name : "");
+    }
     for (int i = 0; i < 400; i++)
     {
         uintptr_t v;

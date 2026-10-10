@@ -1,6 +1,6 @@
 {
-  "passed": 8,
-  "total": 8,
+  "passed": 9,
+  "total": 9,
   "results": {
     "basics": "PASS",
     "collections": "PASS",
@@ -8,6 +8,7 @@
     "interop": "PASS",
     "io": "PASS",
     "runtime": "PASS",
+    "seh": "PASS",
     "strings": "PASS",
     "structs": "PASS"
   }

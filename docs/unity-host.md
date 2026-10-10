@@ -47,3 +47,14 @@ by token; the records keep each type's metadata token for that.
 - `MonoAssemblyName` is touched only through its first member, the name.
 - P/Invoke resolution tries Unity's plugin callback (`mono_set_find_plugin_callback`) and
   its registered dl fallback before `LoadLibrary`.
+
+## Scripted input (`NR_INPUT`)
+
+With `NR_INPUT=<file>`, the host patches the player's imports of `GetCursorPos`,
+`GetAsyncKeyState` and `GetKeyState` and reads commands from the file as it grows, one per
+line, in client pixels: `move X Y`, `click X Y`, `rclick X Y`, `down`, `up`, `key VK`,
+`wait MS`. The commands post the matching window messages and set the state those imports
+report, so a game on a hidden or virtual monitor can be played by a script or by appending
+lines by hand, and the real mouse is never moved. Unity 4 takes the pointer position from
+`GetCursorPos`, which is why posting messages from outside the process doesn't work.
+`runtime/unity_input.c`.

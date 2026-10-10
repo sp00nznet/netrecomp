@@ -15,6 +15,10 @@ static class Program
         Console.WriteLine(string.Join("|", "a,b,,c".Split(',')));
         Console.WriteLine("GroundPlane(Clone)".Contains("GroundPlane(") + " " + "abc".StartsWith("ab") + " " + "abc".EndsWith("bc"));
         Console.WriteLine(string.Compare("apple", "Banana", StringComparison.OrdinalIgnoreCase) < 0);
+        string schema = "characters/humanfemale/JessicaWattsUB";
+        Console.WriteLine(schema.EndsWith("jessicawattsub", StringComparison.OrdinalIgnoreCase) + " " + schema.EndsWith("JessicaWattsUB", StringComparison.Ordinal)
+            + " " + schema.StartsWith("CHARACTERS", StringComparison.OrdinalIgnoreCase) + " " + schema.IndexOf("WATTS", StringComparison.OrdinalIgnoreCase)
+            + " " + schema.EndsWith("jessicawattsub", StringComparison.CurrentCultureIgnoreCase) + " " + schema.EndsWith("x", StringComparison.OrdinalIgnoreCase));
         Console.WriteLine("  trim me ".Trim() + "|" + "x".PadLeft(3, '.') + "|" + "abcdef".Substring(2, 3));
         var sb = new StringBuilder();
         for (int i = 0; i < 5; i++) sb.Append(i).Append(',');

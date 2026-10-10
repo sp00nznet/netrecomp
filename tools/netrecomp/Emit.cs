@@ -32,6 +32,15 @@ sealed class MethodEmitter
     readonly List<Block> blocks = new();
     readonly Stack<string> excVar = new();
     readonly Dictionary<ExceptionHandler, string> finEnd = new();
+    // `leave` out of a __try that has a __finally: clang (x86) runs the finally
+    // through a local unwind on a goto out of the __try, and in a function that
+    // realigns its stack that path addresses the frame through a stale base
+    // pointer. So leaves jump to an exit label at the end of the __try instead,
+    // the __finally runs on fall-through, and a switch after it continues to
+    // the real target (repeating at each enclosing __try).
+    readonly Dictionary<Block, List<Instruction>> leaves = new();
+    HashSet<Block> curOpen = new();
+    int curOff;
 
     sealed class Block { public int TryStart, TryEnd; public List<ExceptionHandler> H = new(); public int End => H.Max(h => h.HandlerEnd?.Offset ?? int.MaxValue); }
 
@@ -117,7 +126,7 @@ sealed class MethodEmitter
             sb.Append($"    {c} l{i}").Append(lay.Kind(locT[i]) == SK.VT ? " = {0};\n" : " = 0;\n");
         }
         foreach (var kv in vars.OrderBy(k => k.Key)) sb.Append($"    {kv.Value} {kv.Key};\n");
-        foreach (var b in blocks) foreach (var h in b.H) if (h.HandlerType == ExceptionHandlerType.Catch || h.HandlerType == ExceptionHandlerType.Fault) sb.Append($"    void* ex{h.HandlerStart.Offset} = 0;\n");
+        foreach (var b in blocks) foreach (var h in b.H) if (h.HandlerType is ExceptionHandlerType.Catch or ExceptionHandlerType.Fault or ExceptionHandlerType.Finally) sb.Append($"    void* ex{h.HandlerStart.Offset} = 0;\n");
         if (g.CctorCheckOnEntry(m)) sb.Append($"    NR_CCTOR({g.Cctor(m.Owner)});\n");
         sb.Append(o);
         sb.Append("}\n");
@@ -173,6 +182,7 @@ sealed class MethodEmitter
             }
             if (stackIn.ContainsKey(ins.Offset))
             {
+                curOff = ins.Offset; curOpen = open;
                 if (labels.Contains(ins.Offset) && !open.Any(x => x.TryStart == ins.Offset)) o.Append($"L{ins.Offset:x4}:;\n");
                 st = (SV[])stackIn[ins.Offset].Clone(); sp = st.Length;
                 var succ = Step(ins);
@@ -196,23 +206,40 @@ sealed class MethodEmitter
         var cat = b.H.Where(h => h.HandlerType == ExceptionHandlerType.Catch).ToList();
         if (fin.Count > 0 && cat.Count > 0) throw new EmitError("catch and finally on one try");
         if (fin.Count > 1) throw new EmitError("two finally handlers on one try");
+        bool hasFinally = fin.Count == 1 && fin[0].HandlerType == ExceptionHandlerType.Finally;
+        if (hasFinally) o.Append($"ex{fin[0].HandlerStart.Offset} = 0;\n");
         o.Append("__try {\n");
         EmitRange(b.TryStart, b.TryEnd, inner);
+        if (hasFinally) o.Append($"X{b.TryStart:x4}:;\n");
         o.Append("}\n");
-        if (fin.Count == 1 && fin[0].HandlerType == ExceptionHandlerType.Finally)
+        if (hasFinally)
         {
+            // No __finally: clang outlines it, and an outlined handler addresses
+            // the parent's locals wrongly when the parent realigns its stack. A
+            // catch-all __except records the exception; the body runs inline on
+            // both paths and rethrows if there was one.
             var h = fin[0];
+            var ev = $"ex{h.HandlerStart.Offset}";
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
-            o.Append("__finally {\n");
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
-            o.Append($"{finEnd[h]}:;\n}}\n");
+            o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n}}\n");
+            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, open);
+            o.Append($"{finEnd[h]}:;\n    if ({ev}) nr_throw({ev});\n");
+            if (leaves.TryGetValue(b, out var exits))
+            {
+                var (so, sf) = (curOpen, curOff);
+                (curOpen, curOff) = (open, b.TryStart);
+                o.Append($"switch (lv{b.TryStart:x4}) {{\n");
+                for (int k = 0; k < exits.Count; k++) { o.Append($"case {k}:\n"); sp = 0; Goto(exits[k]); }
+                o.Append("}\n");
+                (curOpen, curOff) = (so, sf);
+            }
         }
         else if (fin.Count == 1)
         {
             // fault: runs only on exception, then the exception continues.
             var h = fin[0];
             var ev = $"ex{h.HandlerStart.Offset}";
-            o.Append($"__except (nr_catch(GetExceptionInformation(), 0, &{ev})) {{\n");
+            o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n");
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             excVar.Push(ev);
             EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
@@ -226,7 +253,7 @@ sealed class MethodEmitter
             var which = $"w{cat[0].HandlerStart.Offset}";
             vars[which] = "int32_t";
             var ks = string.Join(", ", cat.Select(h => "&" + g.Klass(w.Conv(h.CatchType, m.Owner.Args, m.MArgs))));
-            o.Append($"__except (nr_catch_any(GetExceptionInformation(), (NrClass*[]){{ {ks} }}, {cat.Count}, &{ev}, &{which})) {{\n");
+            o.Append($"__except (nr_catch_any(GetExceptionInformation(), (NrClass*[]){{ {ks} }}, {cat.Count}, 0, 0)) {{\n    {ev} = nr_caught(&{which});\n");
             for (int k = 0; k < cat.Count; k++)
             {
                 var h = cat[k];
@@ -477,7 +504,21 @@ sealed class MethodEmitter
     void LdArg(int a) => Push(Kind(argT[a]), $"a{a}");
     void LdLoc(int i) => Push(Kind(locT[i]), $"l{i}");
     void StLoc(int i) { var v = Pop(); L($"l{i} = {As(locT[i], v)};"); }
-    void Goto(Instruction t) { EdgeMoves(t); L($"goto L{t.Offset:x4};"); labels.Add(t.Offset); }
+    void Goto(Instruction t)
+    {
+        EdgeMoves(t);
+        labels.Add(t.Offset);
+        var b = !emitting ? null : curOpen
+            .Where(x => x.H.Any(h => h.HandlerType == ExceptionHandlerType.Finally) && curOff >= x.TryStart && curOff < x.TryEnd
+                        && !(t.Offset >= x.TryStart && t.Offset < x.TryEnd))
+            .OrderBy(x => x.TryEnd - x.TryStart).FirstOrDefault();
+        if (b == null) { L($"goto L{t.Offset:x4};"); return; }
+        if (!leaves.TryGetValue(b, out var exits)) leaves[b] = exits = new();
+        int id = exits.IndexOf(t);
+        if (id < 0) { exits.Add(t); id = exits.Count - 1; }
+        vars[$"lv{b.TryStart:x4}"] = "int32_t";
+        L($"lv{b.TryStart:x4} = {id}; goto X{b.TryStart:x4};");
+    }
 
     // Joins where paths push different kinds of the same width (a fixed
     // statement's native int vs managed pointer) settle on native int; each

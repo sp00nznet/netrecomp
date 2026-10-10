@@ -134,6 +134,9 @@ void  nr_delegate_init(void* d, void* target, void* fn, const NrMethodDesc* m);
 void* nr_delegate_to_fnptr(void* d);
 NrType* nr_class_type(NrClass* k);
 void* nr_icall(const char* full, const char* name);
+extern int nr_trace_icalls;   /* NR_TRACE_ICALLS=1: log every internal call made */
+void nr_icall_trace(const char* name);
+#define NR_ICALL_TRACE(name) do { if (nr_trace_icalls) nr_icall_trace(name); } while (0)
 void* nr_pinvoke(const char* lib, const char* entry, const char* alt);
 int64_t nr_native_call(void* fn, const uint32_t* args, int32_t n);
 double nr_native_call_fp(void* fn, const uint32_t* args, int32_t n);
@@ -155,6 +158,7 @@ __declspec(noreturn) void nr_throw_notsupported(const char* what);
 __declspec(noreturn) void nr_throw_arith(void);
 int nr_catch(struct _EXCEPTION_POINTERS* ep, NrClass* k, void** ex);
 int nr_catch_any(struct _EXCEPTION_POINTERS* ep, NrClass* const* ks, int n, void** ex, int32_t* which);
+void* nr_caught(int32_t* which);   /* in a handler: what its filter (with null outs) matched */
 
 #define NR_STR(i) (nr_strtab[i] ? nr_strtab[i] : nr_strlit(i))
 #define NR_CCTOR(k) do { if ((k).cctor_state != 2) nr_run_cctor(&(k)); } while (0)
