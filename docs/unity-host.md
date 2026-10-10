@@ -38,7 +38,12 @@ by token; the records keep each type's metadata token for that.
   properties search the parents too.
 - `mono_stack_walk`, `mono_method_get_last_managed` and `mono_pmip` report nothing, so
   Unity's log lines carry no managed stack traces.
-- The liveness functions (Unity's memory profiler) report nothing.
+- The liveness functions walk the heap conservatively (any word that holds the start of a
+  GC object with a class record is a reference), from class statics and from each root
+  Unity passes. Results go to Unity's callback at the end of every `from_root` and
+  `from_statics` call, since Unity attributes them to that root; flushing only at `end`
+  made scene loads unload ~1700 assets the menu still used. The visited set spans the
+  whole calculation. Over-reporting only keeps an asset loaded.
 - `MonoAssemblyName` is touched only through its first member, the name.
 - P/Invoke resolution tries Unity's plugin callback (`mono_set_find_plugin_callback`) and
   its registered dl fallback before `LoadLibrary`.

@@ -114,6 +114,15 @@ static class Program
             if (!t.IsInterface && !t.IsAbstract) g.Construct(tt);
             foreach (var m in t.Methods)
                 if (!m.HasGenericParameters && !m.IsAbstract) g.Root(w.Method(tt, m, none));
+            // Unity's serializer creates field values like List<T> through their default ctor
+            foreach (var f in t.Fields.Where(f => !f.IsStatic))
+            {
+                var ft = w.FieldType(tt, f);
+                if (ft.K != TK.Def || !ft.IsGenericInst || ft.IsValueType || ft.IsInterface || ft.Def.IsAbstract) continue;
+                g.Construct(ft);
+                foreach (var c in ft.Def.Methods.Where(c => c.IsConstructor && !c.IsStatic && c.Parameters.Count == 0))
+                    g.Root(w.Method(ft, c, none));
+            }
         }
     }
 

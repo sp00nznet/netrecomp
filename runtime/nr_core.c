@@ -823,7 +823,9 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
     if (exc) *exc = 0;
     if (!m->fn || !m->invoke)
     {
-        void* e = nr_exception(nr_class_by_name("System", "MissingMethodException"), m->name);
+        char msg[512];
+        snprintf(msg, sizeof msg, "%s.%s::%s (not compiled)", m->klass->ns, m->klass->name, m->name);
+        void* e = nr_exception(nr_class_by_name("System", "MissingMethodException"), msg);
         if (exc) { *exc = e; return 0; }
         nr_throw(e);
     }
