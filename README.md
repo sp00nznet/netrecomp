@@ -15,26 +15,31 @@ the recompiler runs on your machine and writes C into a gitignored folder.
 
 ## Status
 
-**v0.1.0-dev, pre-alpha.** The compiler and the corlib runtime work; the Unity host
-(the `mono.dll` that Unity's player loads) doesn't exist yet.
+**v0.1.0-dev, pre-alpha.** The compiler, the corlib runtime and the Unity host (the
+`mono.dll` that Unity's player loads) work well enough to play Shadowrun Returns from the
+main menu into a level; most of the game is still untested.
 
 | What | State |
 |---|---|
-| Translator | Shadowrun Returns (Steam and GOG, 25 assemblies): **88432/88433 methods** lift; the one left is a P/Invoke taking a non-blittable struct |
+| Translator | Shadowrun Returns (Steam and GOG, 25 assemblies): **88867/88868 methods** lift; the one left is a P/Invoke taking a non-blittable struct |
 | Generated C | all files compile (clang-cl, x86) |
 | Runtime: core, GC, exceptions, threads, file I/O, reflection | conformance tests pass |
-| Runtime: mono embedding API (`mono.dll` for Unity) | not started |
+| Runtime: mono embedding API (`mono.dll` for Unity) | Unity 4.2's player boots, renders, loads saves and runs gameplay; scripted input for automated runs |
 
-Conformance (current corpus): **3/3 tests** match the real CLR's output and exit code.
+Conformance (current corpus): **9/9 tests** match the real CLR's output and exit code.
 See [Conformance](#conformance).
 
 | Title | Repo | State |
 |---|---|---|
-| Shadowrun Returns (2013, Unity 4.1) | shadowrun-returns | lifts and compiles; doesn't boot yet (needs the mono host) |
+| Shadowrun Returns (2013, Unity 4.2) | [shadowrun-returns-recomp](https://github.com/sp00nznet/shadowrun-returns-recomp) | in game (Steam): menus, New Game, character creation, loading saves, exploration |
 
 ## Screenshots
 
-None yet: nothing renders until the Unity host exists.
+Shadowrun Returns (Steam) running on the recompiled `mono.dll`:
+
+![Main menu](https://raw.githubusercontent.com/sp00nznet/shadowrun-returns-recomp/main/docs/screenshots/main-menu-steam.png)
+
+![In game](https://raw.githubusercontent.com/sp00nznet/shadowrun-returns-recomp/main/docs/screenshots/in-game-steam.png)
 
 ## Getting Started
 
@@ -52,12 +57,13 @@ directly:
    ```
    dotnet tools\netrecomp\bin\Release\net8.0\netrecomp.dll lift "D:\Games\Shadowrun Returns\Shadowrun_Data\Managed" -o gen
    ```
-   Expected output: `lifted 88432/88433 methods (4407 icalls, 450/451 pinvokes) in 8.4s -> gen`
+   Expected output: `lifted 88867/88868 methods (4413 icalls, 450/451 pinvokes) in 8.5s -> gen`
 4. Compile it:
    ```
-   py -3 tools\build.py --gen gen --out build\mono.dll --compile-only
+   py -3 tools\build.py --gen gen --out build\mono.dll --opt=-O1
    ```
-   The first run fetches bdwgc into `deps\`. (Linking `mono.dll` waits on the Unity host.)
+   The first run fetches bdwgc into `deps\`. Copy the result over the game's
+   `*_Data\Mono\mono.dll` (keep the original).
 
 Usual trip-ups: `python` opening the Microsoft Store means the Store alias is on; use `py`.
 In Git Bash, pass compiler flags in dash form (`--opt=-O1`): Bash rewrites `/O1` into a path.
@@ -96,13 +102,20 @@ The corlib isn't redistributable, so the harness needs a game's `Managed` folder
 |---|---|
 | `basics` | arithmetic, strings, formatting, virtual/interface dispatch, generics, structs, boxing, enums, iterators, lambdas, multicast delegates, try/catch/finally, null/div-by-zero/range/cast/overflow exceptions, GC churn |
 | `collections` | List, Dictionary with struct keys, HashSet, Queue, Stack, SortedDictionary, LinkedList, ArrayList, Hashtable, LINQ, string switch, array covariance |
-| `runtime` | parsing and formatting, [Flags] enums, reflection (fields, methods, properties, Activator), nullables, struct operators, threads and locks, thread pool, nested finally, file I/O |
+| `runtime` | parsing and formatting, [Flags] enums, reflection (fields, methods, properties, Activator), nullables, struct operators, threads and locks, thread pool, nested finally, file I/O, Guid |
+| `interop` | P/Invoke: stdcall and cdecl, string and array marshalling, bool returns, a managed callback from native code |
+| `io` | File and Directory existence, Path helpers, a write/read round trip |
+| `strings` | Format, Concat, Replace, Split, case, Contains, ordinal and ignore-case comparisons |
+| `hashing` | Hashtable, OrderedDictionary and Dictionary with keys overriding GetHashCode/Equals |
+| `structs` | value-type arrays: ref locals into elements, a generic list of structs, struct operators, Array.Copy |
+| `seh` | foreach over struct enumerators with continue/break/throw, nested finally, return from try, exceptions crossing finally |
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md): the parts and why they're shaped this way
 - [docs/recompiler.md](docs/recompiler.md): reachability, lowering, and the build flags that matter
 - [docs/runtime.md](docs/runtime.md): object model, GC, exceptions, icalls, reflection
+- [docs/unity-host.md](docs/unity-host.md): the mono API Unity uses, liveness, scripted input
 
 ## Building from source
 

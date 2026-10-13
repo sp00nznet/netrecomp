@@ -6,6 +6,7 @@ versions: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `CONTRIBUTING.md`, for going public; README status, screenshots and Getting Started brought up to date.
 - `tools/netrecomp`: IL -> C translator on Mono.Cecil. Full generic instantiation, rapid
   type analysis with generic virtual methods, vtables and interface maps (ECMA-335 II.12.2),
   SEH-based exception regions, stack-kind merging at joins, icall and P/Invoke wrappers,
