@@ -1195,8 +1195,24 @@ static void CompareInfo_construct_compareinfo(void* self, void* locale) { (void)
 static void CompareInfo_free_internal_collator(void* self) { (void)self; }
 static void CompareInfo_assign_sortkey(void* self, void* key, void* src, int32_t opts)
 {
-    (void)self; (void)key; (void)src; (void)opts;
-    nr_throw_notsupported("SortKey");
+    /* No ICU: the key is the UTF-16 code units big-endian (upper-cased for IgnoreCase), so
+       SortKey.Compare orders the way internal_compare's ordinal fallback does */
+    (void)self;
+    NrString* s = STR(src);
+    int32_t n = s ? s->length : 0;
+    void* arr = nr_newarr(nr_array_class(nr_class_by_name("System", "Byte"), 1), n * 2);
+    uint8_t* b = (uint8_t*)ARR(arr)->vector;
+    for (int32_t i = 0; i < n; i++)
+    {
+        uint16_t c = s->chars[i];
+        if (opts & 1) c = (uint16_t)(uintptr_t)CharUpperW((LPWSTR)(uintptr_t)c);
+        b[2 * i] = (uint8_t)(c >> 8); b[2 * i + 1] = (uint8_t)c;
+    }
+    NrClass* k = nr_class_of(key);
+    const NrFieldDesc* f;
+    if ((f = nr_field(k, "key"))) *(void**)((char*)key + f->offset) = arr;
+    if ((f = nr_field(k, "source"))) *(void**)((char*)key + f->offset) = src;
+    if ((f = nr_field(k, "options"))) *(int32_t*)((char*)key + f->offset) = opts;
 }
 
 /* Char tables come from the generated chartab.c (Unicode data, not mono's). */
