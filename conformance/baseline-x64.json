@@ -1,0 +1,15 @@
+{
+  "passed": 7,
+  "total": 9,
+  "results": {
+    "basics": "PASS",
+    "collections": "FAIL (output)",
+    "hashing": "PASS",
+    "interop": "PASS",
+    "io": "PASS",
+    "runtime": "FAIL (timeout)",
+    "seh": "PASS",
+    "strings": "PASS",
+    "structs": "PASS"
+  }
+}
