@@ -486,11 +486,24 @@ API void mono_runtime_object_init(void* o)
 }
 
 void nr_input_main_tick(void);
+/* Class records are static data in this image. Unity 4.6 sometimes passes a receiver that is
+   not a managed object (its first word points into the player), so check before dispatching. */
+extern IMAGE_DOS_HEADER __ImageBase;
+static int in_image(const void* p)
+{
+    const char* b = (const char*)&__ImageBase;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + __ImageBase.e_lfanew);
+    return (const char*)p >= b && (const char*)p < b + nt->OptionalHeader.SizeOfImage;
+}
+
 API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, void** exc)
 {
     TR("mono_runtime_invoke");
     nr_input_main_tick();
     if (!m) { if (exc) *exc = 0; return 0; }
+    /* like mono: an abstract/interface method runs the receiver's override
+       (Unity 4.5+ calls ISerializationCallbackReceiver this way) */
+    if (obj && (m->flags & 0x400) && in_image(*(void**)obj)) m = mono_object_get_virtual_method(obj, m);
     void* r = nr_invoke(m, obj, params, exc);
     if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
     return r;
