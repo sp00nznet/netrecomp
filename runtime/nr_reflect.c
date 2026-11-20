@@ -92,7 +92,18 @@ const NrProp* nr_props_of(NrClass* k, int* n)
         if (!get && !set) continue;
         const char* nm = m->name + 4;
         int j = 0;
-        for (; j < c; j++) if (!strcmp(p[j].name, nm)) break;
+        /* indexers overload by parameters (IDataRecord.this[int] / this[string]):
+         * pair a getter and setter only when the setter's index parameters match */
+        for (; j < c; j++)
+        {
+            if (strcmp(p[j].name, nm) || (get ? p[j].get : p[j].set)) continue;
+            const NrMethodDesc* g = get ? m : p[j].get;
+            const NrMethodDesc* st = get ? p[j].set : m;
+            if (!g || !st) break;
+            int ok = st->n_params == g->n_params + 1;
+            for (int q = 0; ok && q < g->n_params; q++) ok = g->params[q] == st->params[q];
+            if (ok) break;
+        }
         if (j == c) { p[c].klass = k; p[c].name = nm; c++; }
         if (get) p[j].get = m; else p[j].set = m;
     }
@@ -152,8 +163,10 @@ static void* Type_MakeGenericType(void* gt, void* types)
         for (int j = 0; j < n && ok; j++) ok = c->gargs[j] == K(adata(types)[j]);
         if (ok) return nr_type_object(c);
     }
-    char msg[300];
-    _snprintf(msg, sizeof msg, "%s.%s with these arguments was not compiled", d->ns, d->name);
+    char msg[600];
+    int at = _snprintf(msg, sizeof msg, "%s.%s<", d->ns, d->name);
+    for (int j = 0; j < n && at > 0 && at < 500; j++) at += _snprintf(msg + at, sizeof msg - at, "%s%s.%s", j ? "," : "", K(adata(types)[j])->ns, K(adata(types)[j])->name);
+    if (at > 0 && at < 560) _snprintf(msg + at, sizeof msg - at, "> was not compiled");
     msg[sizeof msg - 1] = 0;
     nr_throw_notsupported(msg);
 }
@@ -944,7 +957,8 @@ static intptr_t RT_GetMethodsByName_native(void* self, intptr_t name, int32_t bf
         for (int i = 0; i < c->n_methods; i++)
         {
             const NrMethodDesc* m = &c->methods[i];
-            if (!m->name || is_ctor(m) || !bind_ok(m->flags, bf, c != k) || !name_eq8(m->name, name, ic)) continue;
+            /* generic method instances are not members: reflection sees the definition */
+            if (!m->name || m->mgargs || is_ctor(m) || !bind_ok(m->flags, bf, c != k) || !name_eq8(m->name, name, ic)) continue;
             int hidden = 0;
             if (c != k && m->slot >= 0)
                 for (uint32_t j = 0; j < a->len && !hidden; j++) { const NrMethodDesc* o = (const NrMethodDesc*)a->pdata[j]; hidden = o->slot == m->slot && !strcmp(o->name, m->name); }
@@ -1072,7 +1086,6 @@ static int32_t MonoMethodInfo_get_method_attributes(intptr_t h) { return ((const
 static void* MonoMethod_get_name4(void* m) { return MonoMethod_get_name(m); }
 static void* MonoMethod_self(void* m) { return m; }
 static void* MonoMethod_get_base_method(void* m, uint8_t definition) { (void)definition; return m; }
-static void* MonoMethod_MakeGenericMethod_impl(void* m, void* types) { (void)m; (void)types; nr_throw_notsupported("MethodInfo.MakeGenericMethod"); }
 static int32_t MonoMethod_GetPInvoke(void* m, int32_t* flags, void** entry, void** dll) { (void)m; *flags = 0; *entry = 0; *dll = 0; return 0; }
 static void* MonoField_ResolveType(void* self) { return nr_type_object(GETF(self, const NrFieldDesc*, k_monofield, "fhandle")->type); }
 static void* empty_types(void) { return new_array(nr_class_by_name("System", "Type"), 0); }

@@ -252,12 +252,23 @@ void nr_unbox_nullable(void* o, NrClass* inner, void* out, size_t size, size_t h
 }
 
 static NrClass* underlying(NrClass* k) { return (k->flags & NR_ENUM) ? k->elem : k; }
+static int is_int_like(NrClass* k)
+{
+    static const char* n[] = { "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Char", "Boolean", "IntPtr", "UIntPtr" };
+    if (!k || strcmp(k->ns, "System")) return 0;
+    for (int i = 0; i < 12; i++) if (!strcmp(k->name, n[i])) return 1;
+    return 0;
+}
 
 void* nr_unbox(void* o, NrClass* k)
 {
     if (!o) nr_throw_null();
     NrClass* c = ((NrObj*)o)->klass;
-    if (c != k && underlying(c) != underlying(k)) nr_throw_new("System", "InvalidCastException", "Specified cast is not valid.");
+    /* like the CLR: an enum unboxes as its underlying type, and integers of one size
+     * as each other (int <-> uint). A narrower one reads as a wider one too: mono's
+     * EnumEqualityComparer does UnsafeMov<ushort-enum, int>, which its JIT special-cases;
+     * box payloads are zeroed GC memory, so the extra bytes read as 0. */
+    if (c != k && underlying(c) != underlying(k) && !(is_int_like(underlying(c)) && is_int_like(underlying(k)) && underlying(c)->value_size <= underlying(k)->value_size)) nr_throw_new("System", "InvalidCastException", "Specified cast is not valid.");
     return (char*)o + sizeof(NrObj);
 }
 

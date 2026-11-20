@@ -1206,6 +1206,33 @@ static uint8_t CultureInfo_false1(void* a) { (void)a; return 0; }
 static uint8_t CultureInfo_false2(void* a, int32_t b) { (void)a; (void)b; return 0; }
 static uint8_t CultureInfo_false2s(void* a, void* b) { (void)a; (void)b; return 0; }
 static void CultureInfo_void1(void* a) { (void)a; }
+/* A named culture ("en-US") is built as the invariant culture under that name: same
+ * number/date/text data, Name/TwoLetterISOLanguageName from the request. Games ask
+ * for en-US to get invariant-style parsing, which this gives. ponytail: no per-culture
+ * data (no ICU / culture tables); add them if a title formats for display in a locale. */
+static uint8_t CultureInfo_from_name(void* self, void* name)
+{
+    NrClass* k = OBJ(self)->klass;
+    void* inv = 0;
+    for (int i = 0; i < k->n_methods && !inv; i++)
+        if (!strcmp(k->methods[i].name, "get_InvariantCulture") && k->methods[i].fn) inv = ((void* (*)(void))k->methods[i].fn)();
+    NrString* n = (NrString*)name;
+    if (!inv || !n || n->length < 2 || n->length > 40) return 0;
+    memcpy((char*)self + sizeof(NrObj), (char*)inv + sizeof(NrObj), (size_t)k->instance_size - sizeof(NrObj));
+    static const char* lazy[] = { "numInfo", "dateTimeInfo", "textInfo", "compareInfo", "calendar", "parent_culture", "cached_serialized_form", "m_cultureData" };
+    for (int i = 0; i < 8; i++) { int32_t o = foff(k, lazy[i]); if (o > 0) *(void**)((char*)self + o) = 0; }
+    uint16_t c[41]; int32_t len = n->length, dash = -1;
+    for (int32_t i = 0; i < len; i++) { c[i] = n->chars[i]; if (c[i] == '-' && dash < 0) dash = i; }
+    for (int32_t i = dash + 1; dash > 0 && i < len && len - dash - 1 == 2; i++) if (c[i] >= 'a' && c[i] <= 'z') c[i] -= 32;
+    int32_t o;
+    if ((o = foff(k, "m_name")) > 0) *(void**)((char*)self + o) = nr_str_utf16(c, len);
+    if ((o = foff(k, "iso2lang")) > 0) *(void**)((char*)self + o) = nr_str_utf16(c, 2);
+    if ((o = foff(k, "m_isReadOnly")) > 0) *((uint8_t*)self + o) = 0;
+    /* TextInfoData: ansi, ebcdic, mac, oem code pages, right_to_left, list_sep */
+    static const struct { int32_t ansi, ebcdic, mac, oem; uint8_t rtl, list_sep; } tid = { 1252, 37, 10000, 437, 0, ',' };
+    if ((o = foff(k, "textinfo_data")) > 0) *(const void**)((char*)self + o) = &tid;
+    return 1;
+}
 
 /* CompareInfo without ICU: ordinal, or case-insensitive ordinal. */
 #define IGNORE_CASE(opts) (((opts) & 1) || ((opts) & 0x10000000))   /* IgnoreCase, OrdinalIgnoreCase */
@@ -1603,8 +1630,8 @@ static const NrIcall corlib[] = {
     { "System.Text.Encoding::InternalCodePage", Encoding_InternalCodePage },
     { "System.Globalization.CultureInfo::construct_internal_locale_from_current_locale", CultureInfo_construct_internal_locale_from_current_locale },
     { "System.Globalization.CultureInfo::construct_internal_locale_from_lcid", CultureInfo_false2 },
-    { "System.Globalization.CultureInfo::construct_internal_locale_from_name", CultureInfo_false2s },
-    { "System.Globalization.CultureInfo::construct_internal_locale_from_specific_name", CultureInfo_false2s },
+    { "System.Globalization.CultureInfo::construct_internal_locale_from_name", CultureInfo_from_name },
+    { "System.Globalization.CultureInfo::construct_internal_locale_from_specific_name", CultureInfo_from_name },
     { "System.Globalization.CultureInfo::construct_datetime_format", CultureInfo_void1 },
     { "System.Globalization.CultureInfo::construct_number_format", CultureInfo_void1 },
     { "System.Globalization.CultureInfo::internal_is_lcid_neutral", CultureInfo_false2 },

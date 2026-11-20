@@ -108,6 +108,11 @@ static class Program
             var dot = n.LastIndexOf('.');
             if (w.Corlib.MainModule.GetType(n[..dot], n[(dot + 1)..]) != null) g.Construct(w.SzArray(w.Cor(n[..dot], n[(dot + 1)..])));
         }
+        // static methods the runtime calls by name (mono 4.x thread pool workers)
+        foreach (var (ns, tn, mn) in new[] { ("System.Threading", "_ThreadPoolWaitCallback", "PerformWaitCallback") })
+            if (w.Corlib.MainModule.GetType(ns, tn) is { } td && g.Klass(w.Cor(ns, tn)) != null)   // the record too: found by name
+                foreach (var md in td.Methods.Where(x => x.Name == mn && x.IsStatic && !x.HasGenericParameters))
+                    g.Root(w.Method(w.Cor(ns, tn), md, none));
 
         if (exe != null)
         {

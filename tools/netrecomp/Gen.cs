@@ -144,6 +144,31 @@ sealed class Gen
     // a typeof(X<>) literal), which no IL scan can see.
     void AotHints(MI m)
     {
+        // Enum.GetValues(typeof(E)).Cast<E>(): the array is built at run time, so E[] (with
+        // its IEnumerable<E> methods) is compiled only if something constructs it
+        if ((m.Def.Name is "Cast" or "OfType") && m.MArgs.Length == 1 && m.Owner.Def.FullName == "System.Linq.Enumerable"
+            && m.MArgs[0].K == TK.Def && m.MArgs[0].Def.IsValueType && !m.MArgs[0].IsOpen)
+        {
+            Construct(W.SzArray(m.MArgs[0]));
+            return;
+        }
+        // UnityEvent persistent calls: PersistentCall.GetObjectCall builds CachedInvokableCall<T>
+        // by MakeGenericType for the inspector's argument types (float, int, string, bool, Object)
+        if (m.Def.Name == "GetObjectCall" && m.Owner.Def.FullName == "UnityEngine.Events.PersistentCall")
+        {
+            var cic = m.Owner.Def.Module.GetType("UnityEngine.Events", "CachedInvokableCall`1");
+            var uobj = m.Owner.Def.Module.GetType("UnityEngine", "Object");
+            if (cic == null) return;
+            var args = new List<TT> { W.Cor("System", "Single"), W.Cor("System", "Int32"), W.Cor("System", "String"), W.Cor("System", "Boolean") };
+            if (uobj != null) args.Add(W.Inst(uobj, Array.Empty<TT>()));
+            foreach (var a in args)
+            {
+                var ct = W.Inst(cic, new[] { a });
+                Construct(ct);
+                foreach (var c in cic.Methods.Where(x => x.IsConstructor && !x.IsStatic)) Need(W.Method(ct, c, Array.Empty<TT>()));
+            }
+            return;
+        }
         // System.Xml/System's BinaryCompatibility.RunningOnCheck reads mscorlib's
         // BinaryCompatibility.TargetsAtLeast_* by reflection (every XmlReaderSettings does)
         if (m.Def.Name == "RunningOnCheck" && m.Owner.Def.Name == "BinaryCompatibility")

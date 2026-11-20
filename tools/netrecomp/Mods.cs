@@ -44,6 +44,9 @@ static class Mods
             var td = a.MainModule.GetType(tn);
             if (td == null) continue;
             var c = td.Methods.Where(x => x.Name == mn && x.Parameters.Count + (x.IsStatic ? 0 : 1) == hook.Parameters.Count).ToList();
+            // overloads with the same count: match parameter type names (self excluded)
+            if (c.Count > 1)
+                c = c.Where(x => x.GenericParameters.Count == hook.GenericParameters.Count && x.Parameters.Select(p => p.ParameterType.Name).SequenceEqual(hook.Parameters.Skip(x.IsStatic ? 0 : 1).Select(p => p.ParameterType.Name))).ToList();
             if (c.Count == 1) return c[0];
             throw new Exception($"mod target '{spec}': {c.Count} methods with {hook.Parameters.Count} parameters (counting self)");
         }
@@ -64,7 +67,16 @@ static class Mods
         var b = new MethodBody(t);
         var il = b.GetILProcessor();
         foreach (var a in args) il.Append(a.OpCode == OpCodes.Ldarg && a.Operand == t.Body.ThisParameter ? Instruction.Create(OpCodes.Ldarg_0) : a);
-        il.Append(Instruction.Create(OpCodes.Call, t.Module.ImportReference(hook)));
+        MethodReference call = t.Module.ImportReference(hook);
+        // a generic target calls the hook instantiated at the target's own type parameters
+        if (t.HasGenericParameters)
+        {
+            if (hook.GenericParameters.Count != t.GenericParameters.Count) throw new Exception($"mod: {hook.FullName} needs {t.GenericParameters.Count} type parameters");
+            var gi = new GenericInstanceMethod(call);
+            foreach (var gp in t.GenericParameters) gi.GenericArguments.Add(gp);
+            call = gi;
+        }
+        il.Append(Instruction.Create(OpCodes.Call, call));
         il.Append(Instruction.Create(OpCodes.Ret));
         t.Body = b;
         Offsets(t);
