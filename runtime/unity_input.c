@@ -9,6 +9,8 @@
  *
  *   move X Y        click X Y       down / up      (left button)
  *   rclick X Y      key VK          wait MS
+ *   shot PATH       the game saves its next frame as a PNG (Application.CaptureScreenshot,
+ *                   so it works on a hidden desktop where GDI captures come back wrong)
  *
  * Append lines while the game runs (echo click 180 353 >> input.txt). */
 #include <windows.h>
@@ -21,6 +23,8 @@ void nr_log(const char* fmt, ...);
 static volatile LONG in_x, in_y, in_active;
 static volatile LONG btn_down[256];   /* by virtual key; VK_LBUTTON = 1, VK_RBUTTON = 2 */
 static HWND in_hwnd;
+static char* volatile shot_path;
+static DWORD main_tid;
 
 static BOOL (WINAPI* real_GetCursorPos)(POINT*);
 static SHORT (WINAPI* real_GetAsyncKeyState)(int);
@@ -117,8 +121,23 @@ static void run_command(char* line)
         btn_down[v] = 0; PostMessageA(in_hwnd, WM_KEYUP, v, 0xC0000001);
     }
     else if (sscanf(line, "wait %d", &v) == 1) Sleep(v);
+    else if (!strncmp(line, "shot ", 5))
+    {
+        /* taken on the main thread by nr_input_main_tick; wait for it, up to 5 s */
+        InterlockedExchangePointer((void* volatile*)&shot_path, _strdup(line + 5));
+        for (int i = 0; i < 50 && shot_path; i++) Sleep(100);
+    }
     else if (line[0] && line[0] != '#') { nr_log("netrecomp: input: unknown command '%s'\n", line); return; }
     nr_log("netrecomp: input: %s\n", line);
+}
+
+/* Called on the main thread from mono_runtime_invoke (Unity calls in every frame). */
+void* nr_shot_take(const char* path);
+void nr_input_main_tick(void)
+{
+    if (!shot_path || GetCurrentThreadId() != main_tid) return;
+    char* p = (char*)InterlockedExchangePointer((void* volatile*)&shot_path, 0);
+    if (p) { nr_shot_take(p); free(p); }
 }
 
 static DWORD WINAPI input_thread(void* path)
@@ -155,6 +174,7 @@ void nr_input_start(void)
 {
     static char path[MAX_PATH];
     if (!GetEnvironmentVariableA("NR_INPUT", path, sizeof path)) return;
+    main_tid = GetCurrentThreadId();
     real_GetCursorPos = patch_import("USER32.dll", "GetCursorPos", (void*)fake_GetCursorPos);
     real_GetAsyncKeyState = patch_import("USER32.dll", "GetAsyncKeyState", (void*)fake_GetAsyncKeyState);
     real_GetKeyState = patch_import("USER32.dll", "GetKeyState", (void*)fake_GetKeyState);
@@ -163,4 +183,38 @@ void nr_input_start(void)
     if (!real_GetKeyState) real_GetKeyState = GetKeyState;
     CreateThread(0, 0, input_thread, path, 0, 0);
     nr_log("netrecomp: input: reading commands from %s\n", path);
+}
+
+/* NR_MUTE=1: mute this process's default audio session, so test runs are silent
+ * without touching the system volume. Streams opened later join the session and
+ * stay muted. */
+#define COBJMACROS
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+/* defined here: the SDK declares these as externs only some import libraries carry */
+static const GUID nr_CLSID_MMDeviceEnumerator = { 0xbcde0395, 0xe52f, 0x467c, { 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e } };
+static const GUID nr_IID_IMMDeviceEnumerator = { 0xa95664d2, 0x9614, 0x4f35, { 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6 } };
+static const GUID nr_IID_IAudioSessionManager = { 0xbfa971f1, 0x4d5e, 0x40bb, { 0x93, 0x5e, 0x96, 0x70, 0x39, 0xbf, 0xbe, 0xe6 } };
+static DWORD WINAPI mute_thread(void* p)
+{
+    (void)p;
+    IMMDeviceEnumerator* en = 0; IMMDevice* dev = 0; IAudioSessionManager* sm = 0; ISimpleAudioVolume* vol = 0;
+    CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (SUCCEEDED(CoCreateInstance(&nr_CLSID_MMDeviceEnumerator, 0, CLSCTX_ALL, &nr_IID_IMMDeviceEnumerator, (void**)&en))
+        && SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev))
+        && SUCCEEDED(IMMDevice_Activate(dev, &nr_IID_IAudioSessionManager, CLSCTX_ALL, 0, (void**)&sm))
+        && SUCCEEDED(IAudioSessionManager_GetSimpleAudioVolume(sm, 0, FALSE, &vol)))
+    {
+        ISimpleAudioVolume_SetMute(vol, TRUE, 0);
+        nr_log("netrecomp: audio muted (NR_MUTE)\n");
+        ISimpleAudioVolume_Release(vol);
+    }
+    if (sm) IAudioSessionManager_Release(sm);
+    if (dev) IMMDevice_Release(dev);
+    if (en) IMMDeviceEnumerator_Release(en);
+    return 0;
+}
+void nr_mute_start(void)
+{
+    if (GetEnvironmentVariableA("NR_MUTE", 0, 0) > 0) WaitForSingleObject(CreateThread(0, 0, mute_thread, 0, 0, 0), 5000);
 }
