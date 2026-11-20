@@ -354,6 +354,7 @@ int nr_debug(void);
 void nr_print_stack(int skip);
 void nr_print_addr(void* addr);
 void nr_print_ctx_stack(CONTEXT* c);
+static void mod_off(void* a, char* out, size_t n);
 
 void nr_throw(void* exc)
 {

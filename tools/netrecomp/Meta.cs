@@ -16,6 +16,44 @@ sealed class MetaWriter
 
     public MetaWriter(Gen g) { this.g = g; w = g.W; lay = g.Lay; }
 
+    // Native (marshaled) size and alignment of a sequential struct; 0 when it can't be worked out.
+    int NativeSize(TT t) { try { return NativeStruct(t, 0).size; } catch (Exception) { return 0; } }
+    (int size, int align) NativeStruct(TT t, int depth)
+    {
+        if (depth > 8) throw new InvalidOperationException("nested too deep");
+        int pack = t.Def.PackingSize > 0 ? t.Def.PackingSize : 8, off = 0, max = 1;
+        bool ansi = !t.Def.IsUnicodeClass;
+        foreach (var f in t.Def.Fields.Where(f => !f.IsStatic))
+        {
+            var (fs, fa) = NativeField(w.FieldType(t, f), f.MarshalInfo, ansi, depth);
+            fa = Math.Min(fa, pack); max = Math.Max(max, fa);
+            off = (off + fa - 1) / fa * fa + fs;
+        }
+        int size = Math.Max((off + max - 1) / max * max, t.Def.ClassSize > 0 ? t.Def.ClassSize : 0);
+        return (Math.Max(size, 1), max);
+    }
+    (int size, int align) NativeField(TT ft, MarshalInfo? mi, bool ansi, int depth)
+    {
+        if (mi is FixedArrayMarshalInfo fa && ft.K == TK.SzArray)
+        {
+            var (es, ea) = NativeField(ft.Elem, null, ansi, depth);
+            return (es * Math.Max(fa.Size, 1), ea);
+        }
+        if (mi is FixedSysStringMarshalInfo fss) return (fss.Size * (ansi ? 1 : 2), ansi ? 1 : 2);
+        if (ft.K != TK.Def || !ft.IsValueType) return (4, 4);   // references and pointers: x86
+        if (ft.Def.IsEnum) return NativeField(w.FieldType(ft, ft.Def.Fields.First(f => !f.IsStatic)), null, ansi, depth);
+        switch (ft.Def.FullName)
+        {
+            case "System.Boolean": return mi?.NativeType is NativeType.I1 or NativeType.U1 ? (1, 1) : (4, 4);
+            case "System.Char": return ansi && mi?.NativeType is not (NativeType.I2 or NativeType.U2) ? (1, 1) : (2, 2);
+            case "System.SByte": case "System.Byte": return (1, 1);
+            case "System.Int16": case "System.UInt16": return (2, 2);
+            case "System.Int32": case "System.UInt32": case "System.Single": case "System.IntPtr": case "System.UIntPtr": return (4, 4);
+            case "System.Int64": case "System.UInt64": case "System.Double": return (8, 8);
+        }
+        return NativeStruct(ft, depth + 1);
+    }
+
     static bool Real(TT t) => t.K != TK.Def || t.Def != null;
 
     public void Close()
@@ -290,6 +328,16 @@ sealed class MetaWriter
         sb.Append("\nNrClass* const nr_classes[] = {\n");
         foreach (var t in classes) sb.Append($"    &K{t.Id},\n");
         sb.Append($"}};\nconst int32_t nr_n_classes = {classes.Count};\n\n");
+
+        // Marshal.SizeOf: structs whose native layout differs from the managed one
+        // ([MarshalAs] arrays and strings, 4-byte BOOL, ANSI char). Steamworks.NET's
+        // Packsize.Test checks one of these before SteamAPI.Init.
+        var ms = classes.Where(t => t.K == TK.Def && t.IsValueType && !t.Def.IsEnum && !t.Def.IsExplicitLayout && !t.IsOpen
+                                    && t.Def.Fields.Any(f => !f.IsStatic && (f.HasMarshalInfo || f.FieldType.FullName is "System.Boolean" or "System.Char")))
+                        .Select(t => (t, n: NativeSize(t))).Where(x => x.n > 0).ToList();
+        sb.Append("const NrMarshalSize nr_marshal_sizes[] = {\n");
+        foreach (var (t, n) in ms) sb.Append($"    {{ &K{t.Id}, {n} }},\n");
+        sb.Append($"    {{ 0, 0 }}\n}};\nconst int32_t nr_n_marshal_sizes = {ms.Count};\n\n");
 
         // GVM tables
         foreach (var kv in g.Gvms)
