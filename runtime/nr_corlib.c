@@ -583,7 +583,21 @@ static int32_t Marshal_SizeOf(void* t)
     return nr_value_size(k);
 }
 static intptr_t Marshal_UnsafeAddrOfPinnedArrayElement(void* arr, int32_t idx) { return (intptr_t)((char*)ARR(arr)->vector + (size_t)idx * OBJ(arr)->klass->elem_size); }
-static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del) { (void)del; NrClass* k = OBJ(o)->klass; memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj))); }
+static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del)
+{
+    (void)del;
+    NrClass* k = OBJ(o)->klass;
+    memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj)));
+    /* delegate fields cross as function pointers (Steamworks.NET builds its callback vtable this way) */
+    for (int i = 0; i < k->n_fields; i++)
+    {
+        const NrFieldDesc* f = &k->fields[i];
+        if ((f->flags & 0x10) || !f->type || !(f->type->flags & NR_DELEGATE)) continue;
+        void** slot = (void**)((char*)p + f->offset - sizeof(NrObj));
+        void* d = *(void**)((char*)o + f->offset);
+        *slot = d ? nr_delegate_to_fnptr(d) : 0;
+    }
+}
 static void* Marshal_PtrToStructure(intptr_t p, void* t)
 {
     NrClass* k = nr_type_class(t);

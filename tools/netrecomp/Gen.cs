@@ -138,6 +138,14 @@ sealed class Gen
         {
             var cc = t.Def.Methods.FirstOrDefault(x => x.IsConstructor && x.IsStatic);
             if (cc != null) Need(W.Method(t, cc, Array.Empty<TT>()));
+            // Marshal.StructureToPtr turns delegate fields of interop layouts into function
+            // pointers (Steamworks.NET's CCallbackBaseVTable), so those delegates need thunks.
+            if (!t.Def.IsAutoLayout)
+                foreach (var f in t.Def.Fields.Where(f => !f.IsStatic))
+                {
+                    var ft = W.FieldType(t, f);
+                    if (IsDelegate(ft)) RevPool(ft, quiet: true);   // managed-only structs hold delegates too
+                }
         }
     }
 
@@ -600,7 +608,7 @@ sealed class Gen
     // delegate instance through a GC handle (nr_delegate_to_fnptr).
     public const int RevPoolSize = 32;
     public readonly Dictionary<TT, string> RevPools = new();
-    void RevPool(TT d)
+    void RevPool(TT d, bool quiet = false)
     {
         if (RevPools.ContainsKey(d)) return;
         Klass(d);
@@ -609,7 +617,7 @@ sealed class Gen
         // marshaling it then fails at run time instead of failing the whole lift.
         var bad = Enumerable.Range(0, inv.Def.Parameters.Count).Select(i => W.ParamType(inv, i))
             .FirstOrDefault(pt => !(pt.K == TK.ByRef || Blittable(pt) || pt.K == TK.Def && pt.Def.FullName is "System.String" or "System.Boolean"));
-        if (bad != null) { var why = "reverse P/Invoke parameter " + bad.Key; Failures[why] = Failures.GetValueOrDefault(why) + 1; return; }
+        if (bad != null) { if (quiet) return; var why = "reverse P/Invoke parameter " + bad.Key; Failures[why] = Failures.GetValueOrDefault(why) + 1; return; }
         Need(inv);
         RevPools[d] = "";
     }

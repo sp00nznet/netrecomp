@@ -330,6 +330,7 @@ void nr_throw_new(const char* ns, const char* name, const char* msg)
 int nr_debug(void);
 void nr_print_stack(int skip);
 void nr_print_addr(void* addr);
+static void mod_off(void* a, char* out, size_t n);
 
 void nr_throw(void* exc)
 {
@@ -370,7 +371,13 @@ void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
     switch (r->ExceptionCode)
     {
     case EXCEPTION_ACCESS_VIOLATION:
-        if (nr_debug()) { nr_log("netrecomp: access violation at %p (address %p)\n", r->ExceptionAddress, (void*)r->ExceptionInformation[1]); nr_print_addr(r->ExceptionAddress); }
+        if (nr_debug())
+        {
+            char mo[MAX_PATH + 16];
+            mod_off(r->ExceptionAddress, mo, sizeof mo);   /* no allocation: the heap may be what broke */
+            nr_log("netrecomp: access violation at %p %s (address %p)\n", r->ExceptionAddress, mo, (void*)r->ExceptionInformation[1]);
+            nr_print_addr(r->ExceptionAddress);
+        }
         name = "NullReferenceException"; msg = "Object reference not set to an instance of an object"; break;
     case EXCEPTION_INT_DIVIDE_BY_ZERO: name = "DivideByZeroException"; msg = "Division by zero"; break;
     case EXCEPTION_INT_OVERFLOW: name = "ArithmeticException"; msg = "Overflow"; break;

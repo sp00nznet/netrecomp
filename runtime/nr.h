@@ -112,6 +112,10 @@ extern void* nr_strtab[];
 extern const NrStrLit nr_strlits[];
 extern NrClass* const nr_classes[];
 extern const int32_t nr_n_classes;
+/* structs whose marshaled size differs from the managed one ([MarshalAs] arrays, BOOL) */
+typedef struct { NrClass* klass; int32_t size; } NrMarshalSize;
+extern const NrMarshalSize nr_marshal_sizes[];
+extern const int32_t nr_n_marshal_sizes;
 extern NrImage* const nr_images[];
 extern const int32_t nr_n_images;
 
