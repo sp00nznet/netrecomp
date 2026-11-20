@@ -136,12 +136,25 @@ void* nr_pinvoke_fallback(const char* lib, const char* entry)
     return 0;
 }
 
+static void* data_dir_icall(void)
+{
+    char d[MAX_PATH];
+    GetEnvironmentVariableA("NR_DATA_DIR", d, MAX_PATH);
+    CreateDirectoryA(d, 0);
+    return nr_str_utf8(d);
+}
+
 /* Unity's engine calls, by "Namespace.Type::Method" */
 API void mono_add_internal_call(const char* name, const void* fn)
 {
     TR("mono_add_internal_call");
     if (trace_on > 0) nr_log("[mono]   icall %s = exe+0x%x\n", name, (unsigned)((const char*)fn - (const char*)GetModuleHandleA(0)));
-    ensure_init(); nr_add_icall(name, fn);
+    ensure_init();
+    /* NR_DATA_DIR: test runs keep saves out of the player's real profile */
+    static char data_dir[MAX_PATH];
+    if (!strcmp(name, "UnityEngine.Application::get_persistentDataPath") && GetEnvironmentVariableA("NR_DATA_DIR", data_dir, MAX_PATH))
+    { nr_add_icall(name, (void*)data_dir_icall); return; }
+    nr_add_icall(name, fn);
 }
 
 /* ---- domains ---- */
@@ -382,7 +395,8 @@ API char* mono_type_get_name(NrType* t)
 /* ---- fields ---- */
 
 API const char* mono_field_get_name(const NrFieldDesc* f) { TR("mono_field_get_name"); return f->name; }
-API NrType* mono_field_get_type(const NrFieldDesc* f) { TR("mono_field_get_type"); if (trace_on > 0) nr_log("[mono]   field %s.%s type %s.%s code %d flags 0x%x\n", f->parent->name, f->name, f->type->ns, f->type->name, f->type->byval_arg.type, f->flags); return f->byref ? &f->type->this_arg : &f->type->byval_arg; }
+static int trace_fields = -1;   /* NR_TRACE_FIELDS=1: only the field queries (what Unity serializes) */
+API NrType* mono_field_get_type(const NrFieldDesc* f) { TR("mono_field_get_type"); if (trace_fields < 0) trace_fields = GetEnvironmentVariableA("NR_TRACE_FIELDS", 0, 0) > 0; if (trace_on > 0 || trace_fields > 0) nr_log("[mono]   field %s.%s type %s.%s code %d flags 0x%x\n", f->parent->name, f->name, f->type->ns, f->type->name, f->type->byval_arg.type, f->flags); return f->byref ? &f->type->this_arg : &f->type->byval_arg; }
 API int mono_field_get_offset(const NrFieldDesc* f) { TR("mono_field_get_offset"); return f->offset; }
 API uint32_t mono_field_get_flags(const NrFieldDesc* f) { TR("mono_field_get_flags"); return f->flags; }
 API void mono_field_get_value(void* obj, const NrFieldDesc* f, void* out) { TR("mono_field_get_value"); memcpy(out, (char*)obj + f->offset, (size_t)nr_value_size(f->type)); }
@@ -627,6 +641,8 @@ API int64_t mono_gc_get_used_size(void) { TR("mono_gc_get_used_size"); return (i
  * keeps an asset loaded; under-reporting unloads one that is still in use. */
 typedef void (*LivenessCb)(void** objs, int n, void* user);
 typedef void (*WorldCb)(void);
+struct Liveness;
+static void live_track(struct Liveness* s, int add);
 typedef struct Liveness {
     NrClass* filter; LivenessCb cb; void* user;
     WorldCb on_start, on_stop;    /* Unity 2017+: called around the stopped world */
@@ -700,6 +716,7 @@ API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, L
 #endif
     s->max_out = max && max < 64 ? max : 64;
     s->out = (void**)malloc(s->max_out * sizeof(void*));
+    live_track(s, 1);
     if (s->on_stop) s->on_stop();
     GC_disable();   /* nothing is freed while the walk holds raw pointers */
     return s;
@@ -707,14 +724,34 @@ API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, L
 API void mono_unity_liveness_finalize(Liveness* s) { TR("mono_unity_liveness_finalize"); live_flush(s); }
 API void mono_unity_liveness_stop_gc_world(Liveness* s) { TR("mono_unity_liveness_stop_gc_world"); (void)s; }
 API void mono_unity_liveness_start_gc_world(Liveness* s) { TR("mono_unity_liveness_start_gc_world"); (void)s; }
-API void mono_unity_liveness_free_struct(Liveness* s) { TR("mono_unity_liveness_free_struct"); free(s->out); free(s->seen); free(s->work); free(s); }
+/* end and free_struct both release the state; whichever comes second finds it gone */
+static Liveness* live_states[8];
+static CRITICAL_SECTION live_lock;
+static void live_track(Liveness* s, int add)
+{
+    static int init;
+    if (!init) { InitializeCriticalSection(&live_lock); init = 1; }
+    EnterCriticalSection(&live_lock);
+    for (int i = 0; i < 8; i++) if (add ? !live_states[i] : live_states[i] == s) { live_states[i] = add ? s : 0; break; }
+    LeaveCriticalSection(&live_lock);
+}
+static int live_release(Liveness* s)
+{
+    int found = 0;
+    EnterCriticalSection(&live_lock);
+    for (int i = 0; i < 8; i++) if (live_states[i] == s) { live_states[i] = 0; found = 1; }
+    LeaveCriticalSection(&live_lock);
+    if (found) { free(s->out); free(s->seen); free(s->work); free(s); }
+    return found;
+}
+API void mono_unity_liveness_free_struct(Liveness* s) { TR("mono_unity_liveness_free_struct"); live_release(s); }
 API void mono_unity_liveness_calculation_end(Liveness* s)
 {
     TR("mono_unity_liveness_calculation_end");
     live_flush(s);
     GC_enable();
     if (s->on_start) s->on_start();
-    free(s->out); free(s->seen); free(s->work); free(s);
+    live_release(s);
 }
 API void mono_unity_liveness_calculation_from_root(void* root, Liveness* s)
 {
@@ -737,7 +774,7 @@ API void mono_unity_liveness_calculation_from_statics(Liveness* s)
 
 API void* mono_thread_attach(NrDomain* d) { TR("mono_thread_attach"); (void)d; ensure_init(); nr_thread_attach(); return nr_current_thread_object(); }
 API void* mono_thread_current(void) { TR("mono_thread_current"); return nr_current_thread_object(); }
-API void mono_thread_detach(void* t) { TR("mono_thread_detach"); (void)t; }
+API void mono_thread_detach(void* t) { TR("mono_thread_detach"); (void)t; nr_thread_detach(); }
 API void mono_thread_exit(void) { TR("mono_thread_exit"); ExitThread(0); }
 API void mono_thread_set_main(void* t) { TR("mono_thread_set_main"); (void)t; }
 API void mono_thread_push_appdomain_ref(NrDomain* d) { TR("mono_thread_push_appdomain_ref"); (void)d; }

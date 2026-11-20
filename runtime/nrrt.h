@@ -58,6 +58,7 @@ void* nr_virtual_desc(const NrMethodDesc* m, void* obj, const NrMethodDesc** out
 
 /* threads */
 void nr_thread_attach(void);
+void nr_thread_detach(void);
 void* nr_current_thread_object(void);
 
 /* gc handles */

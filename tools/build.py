@@ -66,7 +66,8 @@ def main():
         srcs.append(host)
     hdrs = [os.path.join(a.gen, "nrgen.h"), os.path.join(a.gen, "nrcfg.h"), os.path.join(RUNTIME, "nr.h"), os.path.join(RUNTIME, "nrrt.h")]
     hdr_time = max(os.path.getmtime(h) for h in hdrs if os.path.exists(h))
-    flags = ["-m64" if a.arch == "x64" else "-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks", "/EHa", "/W0", "-Wno-everything",
+    flags = ["-m64" if a.arch == "x64" else "-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks", "/EHa", "/W0", "-Wno-everything", "-Werror=implicit-function-declaration",  # an undeclared call returns int: truncates pointers on x64
+             
              "-ferror-limit=50", "/I", RUNTIME, "/I", a.gen, "/I", os.path.join(GC_DIR, "include"), "/DNR_BUILD"] + GC_DEFS
 
     def one(src):

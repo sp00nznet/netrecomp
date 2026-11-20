@@ -533,7 +533,11 @@ static uint8_t GCHandle_CheckCurrentDomain(int32_t h) { (void)h; return 1; }
 
 /* ---- Marshal (the common subset) ---- */
 
-static intptr_t Marshal_AllocHGlobal(intptr_t n) { void* p = malloc((size_t)(n ? n : 1)); if (!p) nr_throw_new("System", "OutOfMemoryException", 0); return (intptr_t)p; }
+/* ponytail: Marshal.SizeOf ignores [MarshalAs(ByValArray/ByValTStr)] layouts,
+ * so a buffer sized by it can be smaller than what native code writes into it
+ * (Steamworks callbacks). The slack keeps that off the heap; the real fix is
+ * marshal sizes and copies computed from the MarshalAs metadata. */
+static intptr_t Marshal_AllocHGlobal(intptr_t n) { void* p = calloc(1, (size_t)n + 4096); if (!p) nr_throw_new("System", "OutOfMemoryException", 0); return (intptr_t)p; }
 static void Marshal_FreeHGlobal(intptr_t p) { free((void*)p); }
 static intptr_t Marshal_AllocCoTaskMem(int32_t n) { return (intptr_t)CoTaskMemAlloc((SIZE_T)n); }
 static void Marshal_FreeCoTaskMem(intptr_t p) { CoTaskMemFree((void*)p); }
@@ -582,7 +586,27 @@ static int32_t Marshal_SizeOf(void* t)
     return nr_value_size(k);
 }
 static intptr_t Marshal_UnsafeAddrOfPinnedArrayElement(void* arr, int32_t idx) { return (intptr_t)((char*)ARR(arr)->vector + (size_t)idx * OBJ(arr)->klass->elem_size); }
-static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del) { (void)del; NrClass* k = OBJ(o)->klass; memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj))); }
+/* Delegate fields marshal as native function pointers (Steamworks.NET builds
+ * its callback vtables this way). ponytail: other non-blittable fields
+ * (bool, string, MarshalAs arrays) still copy as their managed bits. */
+static void marshal_delegates(NrClass* k, const char* src, char* dst)
+{
+    for (; k; k = k->parent)
+        for (int i = 0; i < k->n_fields; i++)
+        {
+            const NrFieldDesc* f = &k->fields[i];
+            if ((f->flags & 0x10) || f->offset < 0 || !(f->type->flags & NR_DELEGATE)) continue;
+            void* d = *(void* const*)(src + f->offset);
+            *(void**)(dst + f->offset - sizeof(NrObj)) = d ? nr_delegate_to_fnptr(d) : 0;
+        }
+}
+static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del)
+{
+    (void)del;
+    NrClass* k = OBJ(o)->klass;
+    memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj)));
+    marshal_delegates(k, (const char*)o, (char*)p);
+}
 static void* Marshal_PtrToStructure(intptr_t p, void* t)
 {
     NrClass* k = nr_type_class(t);
@@ -676,6 +700,15 @@ void nr_thread_attach(void)
     struct GC_stack_base sb;
     if (GC_get_stack_base(&sb) == GC_SUCCESS) GC_register_my_thread(&sb);
     thread_object_for_current(0);
+}
+
+/* an engine thread leaving managed code for good (mono_thread_detach) */
+void nr_thread_detach(void)
+{
+    if (!tinfo) return;
+    nr_gchandle_free(tinfo->handle);
+    free(tinfo); tinfo = 0;
+    GC_unregister_my_thread();
 }
 
 void* nr_current_thread_object(void)

@@ -151,6 +151,10 @@ sealed class Gen
         if (!constructed.Add(t)) return;
         constructedList.Add(t);
         Klass(t);
+        // a delegate meant for native code (Steamworks.NET's callback vtables) gets thunks
+        // even when no P/Invoke signature names it: it travels in struct fields
+        if (IsDelegate(t) && t.Def.CustomAttributes.Any(c => c.AttributeType.Name == "UnmanagedFunctionPointerAttribute"))
+            try { RevPool(t); } catch (EmitError e) { Console.Error.WriteLine($"warning: no native thunks for {t.Key}: {e.Message}"); }
         var L = Lay.Full(t);
         if (t.K is TK.SzArray or TK.Array) Construct(t.Elem.IsValueType ? t.Elem : t.Elem);
         foreach (var s in L.Slots) if (s != null && !s.Def.IsAbstract) Need(s);
@@ -264,11 +268,14 @@ sealed class Gen
                     var impl = GvmImpl(t, g);
                     if (impl != null && !reached.Contains(impl)) { Need(impl); more = true; }
                 }
-            more |= At.Scan(klassUsed.Concat(constructed));
+            // base classes too: a generic base (SerializableDictionaryBase<K,V>) carries [SerializeField] fields Unity reads
+            more |= At.Scan(klassUsed.Concat(constructed).SelectMany(Bases).Distinct());
             if (!more && queue.Count == 0 && gvms.Count == gvmSeen) break;
             gvmSeen = gvms.Count;
         }
     }
+
+    IEnumerable<TT> Bases(TT t) { for (var c = t; c != null && c.K == TK.Def; c = W.BaseOf(c)) yield return c; }
 
     public MI? GvmImpl(TT t, MI decl)
     {

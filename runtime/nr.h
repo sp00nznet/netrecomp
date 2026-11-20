@@ -150,6 +150,7 @@ void  nr_run_cctor(NrClass* k);
 void  nr_delegate_init(void* d, void* target, void* fn, const NrMethodDesc* m);
 void* nr_delegate_to_fnptr(void* d);
 NrType* nr_class_type(NrClass* k);
+void* nr_type_object(NrClass* k);   /* attribute factories pass typeof() arguments */
 void* nr_icall(const char* full, const char* name);
 extern int nr_trace_icalls;   /* NR_TRACE_ICALLS=1: log every internal call made */
 void nr_icall_trace(const char* name);
