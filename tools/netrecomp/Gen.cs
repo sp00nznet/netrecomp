@@ -681,6 +681,11 @@ sealed class Gen
         if (RevPools.ContainsKey(d)) return;
         Klass(d);
         var inv = W.Method(d, d.Def.Methods.First(x => x.Name == "Invoke"), Array.Empty<TT>());
+        // A delegate whose signature can't cross (StringBuilder, struct by value...) gets no pool:
+        // marshaling it then fails at run time instead of failing the whole lift.
+        var bad = Enumerable.Range(0, inv.Def.Parameters.Count).Select(i => W.ParamType(inv, i))
+            .FirstOrDefault(pt => !(pt.K == TK.ByRef || Blittable(pt) || pt.K == TK.Def && pt.Def.FullName is "System.String" or "System.Boolean"));
+        if (bad != null) { var why = "reverse P/Invoke parameter " + bad.Key; Failures[why] = Failures.GetValueOrDefault(why) + 1; return; }
         Need(inv);
         RevPools[d] = "";
     }

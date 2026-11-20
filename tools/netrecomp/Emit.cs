@@ -108,8 +108,8 @@ sealed class MethodEmitter
         foreach (var h in body.ExceptionHandlers)
         {
             if (h.HandlerType == ExceptionHandlerType.Filter) throw new EmitError("filter block");
-            var b = blocks.FirstOrDefault(x => x.TryStart == h.TryStart.Offset && x.TryEnd == h.TryEnd.Offset);
-            if (b == null) blocks.Add(b = new Block { TryStart = h.TryStart.Offset, TryEnd = h.TryEnd.Offset });
+            var b = blocks.FirstOrDefault(x => x.TryStart == h.TryStart.Offset && x.TryEnd == (h.TryEnd?.Offset ?? body.CodeSize));
+            if (b == null) blocks.Add(b = new Block { TryStart = h.TryStart.Offset, TryEnd = (h.TryEnd?.Offset ?? body.CodeSize) });
             b.H.Add(h);
         }
         Analyse();
@@ -161,6 +161,9 @@ sealed class MethodEmitter
             foreach (var t in next) work.Push((t, st.Take(sp).ToArray()));
         }
     }
+
+    // Cecil leaves HandlerEnd null for a handler that runs to the end of the method.
+    int HEnd(ExceptionHandler h) => h.HandlerEnd?.Offset ?? body.CodeSize;
 
     void EmitRange(int start, int end, HashSet<Block> open)
     {
@@ -222,7 +225,7 @@ sealed class MethodEmitter
             var ev = $"ex{h.HandlerStart.Offset}";
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n}}\n");
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, open);
+            EmitRange(h.HandlerStart.Offset, HEnd(h), open);
             o.Append($"{finEnd[h]}:;\n    if ({ev}) nr_throw({ev});\n");
             if (leaves.TryGetValue(b, out var exits))
             {
@@ -242,7 +245,7 @@ sealed class MethodEmitter
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n");
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             excVar.Push(ev);
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, inner);
+            EmitRange(h.HandlerStart.Offset, HEnd(h), inner);
             excVar.Pop();
             o.Append($"{finEnd[h]}:;\n    nr_throw({ev});\n}}\n");
         }
@@ -263,7 +266,7 @@ sealed class MethodEmitter
                 // The handler's IL starts with the exception on the stack.
                 st = new[] { new SV(SK.P, null) }; sp = 1;
                 o.Append($"    s0p = {hv};\n"); vars["s0p"] = "void*";
-                EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, inner);
+                EmitRange(h.HandlerStart.Offset, HEnd(h), inner);
                 excVar.Pop();
             }
             o.Append("}\n}\n");
