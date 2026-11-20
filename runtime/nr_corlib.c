@@ -427,6 +427,20 @@ static void Environment_InternalSetEnvironmentVariable(void* name, void* value)
 static void* Environment_GetWindowsFolderPath(int32_t folder)
 {
     wchar_t buf[MAX_PATH];
+    /* NR_DATA_DIR also stands in for the per-user folders a game writes to (Documents,
+     * AppData, LocalAppData, Saved Games...: <NR_DATA_DIR>/folder-<CSIDL>), so a test run
+     * can't touch the player's real (possibly cloud-synced) files. */
+    static const int32_t user[] = { 0x05 /*Personal*/, 0x1a /*AppData*/, 0x1c /*LocalAppData*/, 0x0d /*MyMusic*/, 0x27 /*MyPictures*/, 0x0e /*MyVideo*/, 0x10 /*Desktop*/ };
+    wchar_t dd[MAX_PATH];
+    if (GetEnvironmentVariableW(L"NR_DATA_DIR", dd, MAX_PATH))
+        for (int i = 0; i < 7; i++)
+            if ((folder & 0xff) == user[i])
+            {
+                _snwprintf(buf, MAX_PATH, L"%s\\folder-%02x", dd, user[i]);
+                buf[MAX_PATH - 1] = 0;
+                CreateDirectoryW(dd, 0); CreateDirectoryW(buf, 0);
+                return nr_str_utf16((uint16_t*)buf, (int32_t)wcslen(buf));
+            }
     if (SHGetFolderPathW(0, folder, 0, 0, buf) != 0) return nr_str_utf8("");
     return nr_str_utf16((uint16_t*)buf, (int32_t)wcslen(buf));
 }
