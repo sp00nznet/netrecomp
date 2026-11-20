@@ -104,6 +104,18 @@ sealed class Gen
     // a typeof(X<>) literal), which no IL scan can see.
     void AotHints(MI m)
     {
+        // System.Xml/System's BinaryCompatibility.RunningOnCheck reads mscorlib's
+        // BinaryCompatibility.TargetsAtLeast_* by reflection (every XmlReaderSettings does)
+        if (m.Def.Name == "RunningOnCheck" && m.Owner.Def.Name == "BinaryCompatibility")
+        {
+            var bc = W.Corlib.MainModule.GetType("System.Runtime.Versioning", "BinaryCompatibility");
+            if (bc != null)
+            {
+                var bt = W.Cor("System.Runtime.Versioning", "BinaryCompatibility");
+                foreach (var g in bc.Methods.Where(x => x.IsStatic && x.IsGetter)) Need(W.Method(bt, g, Array.Empty<TT>()));
+            }
+            return;
+        }
         // new T() is Activator.CreateInstance<T>(), which reaches T's default ctor by reflection
         if (m.Def.Name == "CreateInstance" && m.MArgs.Length == 1 && m.Owner.Def.FullName == "System.Activator")
         {

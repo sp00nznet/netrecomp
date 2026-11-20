@@ -703,10 +703,17 @@ static void* find_export(HMODULE h, const char* entry)
 /* Library lookup order: the module itself for __Internal, then LoadLibrary
  * (with and without .dll), and only then the host's plugin hooks, which in a
  * Unity player log every miss. */
+static intptr_t no_steam_entry(void) { return 0; }
+
 void* nr_pinvoke(const char* lib, const char* entry, const char* alt)
 {
     HMODULE h = 0;
     char path[MAX_PATH * 2];
+    /* NR_NO_STEAM=1: every steam_api call returns 0 (SteamAPI_Init fails), so a test
+     * run can't touch the player's Steam Cloud files, stats or achievements. */
+    static int no_steam = -1;
+    if (no_steam < 0) no_steam = GetEnvironmentVariableA("NR_NO_STEAM", path, sizeof path) > 0 && path[0] != '0';
+    if (no_steam && (strstr(lib, "steam_api") || strstr(lib, "CSteamworks"))) return (void*)no_steam_entry;
     if (!strcmp(lib, "__Internal")) h = GetModuleHandleA(0);
     if (!h) h = LoadLibraryA(lib);
     if (!h)

@@ -3,10 +3,13 @@
  * Unity does) join that session, so muting it once at start-up covers them. */
 #define COBJMACROS
 #define CINTERFACE
+#include <winsock2.h>
 #include <windows.h>
+#include <string.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 /* the C headers declare these without defining them */
 static const GUID CLSID_MMDevEnum_ = { 0xbcde0395, 0xe52f, 0x467c, { 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e } };
@@ -35,4 +38,34 @@ void nr_mute_start(void)
     if (en) IMMDeviceEnumerator_Release(en);
     if (SUCCEEDED(init)) CoUninitialize();
     nr_log("netrecomp: NR_MUTE %s\n", ok ? "on" : "failed (no audio device?)");
+}
+
+/* NR_OFFLINE=1: no network for this process. The resolver and connect entry
+ * points of ws2_32 are overwritten with a stub that fails, so neither managed
+ * code nor the native player (analytics, crash upload, web requests) reaches
+ * a server. Loopback is still refused too: ponytail: allow 127.0.0.1 if a
+ * game ever needs a local server. */
+static int WSAAPI offline_fail(void) { WSASetLastError(WSAENETUNREACH); return SOCKET_ERROR; }
+static void* WSAAPI offline_null(void) { WSASetLastError(WSAHOST_NOT_FOUND); return 0; }
+static int WSAAPI offline_eai(void) { return WSAHOST_NOT_FOUND; }
+static void stub_out(HMODULE m, const char* fn, void* to)
+{
+    unsigned char* p = m ? (unsigned char*)GetProcAddress(m, fn) : 0;
+    DWORD old;
+    if (!p || !VirtualProtect(p, 12, PAGE_EXECUTE_READWRITE, &old)) return;
+    p[0] = 0x48; p[1] = 0xB8; memcpy(p + 2, &to, 8);   /* mov rax, to */
+    p[10] = 0xFF; p[11] = 0xE0;                       /* jmp rax */
+    VirtualProtect(p, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 12);
+}
+void nr_offline_start(void)
+{
+    if (GetEnvironmentVariableA("NR_OFFLINE", 0, 0) == 0) return;
+    HMODULE w = LoadLibraryA("ws2_32.dll");
+    static const char* fail[] = { "connect", "WSAConnect", "WSAConnectByNameA", "WSAConnectByNameW", "sendto", "WSASendTo" };
+    static const char* eai[] = { "getaddrinfo", "GetAddrInfoW", "GetAddrInfoExA", "GetAddrInfoExW" };
+    for (int i = 0; i < 6; i++) stub_out(w, fail[i], (void*)offline_fail);
+    for (int i = 0; i < 4; i++) stub_out(w, eai[i], (void*)offline_eai);
+    stub_out(w, "gethostbyname", (void*)offline_null);
+    nr_log("netrecomp: NR_OFFLINE on\n");
 }

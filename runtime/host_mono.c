@@ -74,9 +74,10 @@ static void ensure_init(void)
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
 void nr_input_start(void);
 void nr_mute_start(void);
+void nr_offline_start(void);
 static DWORD shot_thread;     /* NR_SHOT, see shot_poll */
 static ULONGLONG shot_t0;
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); shot_thread = GetCurrentThreadId(); shot_t0 = GetTickCount64(); return &root_domain; }
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); nr_offline_start(); shot_thread = GetCurrentThreadId(); shot_t0 = GetTickCount64(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
