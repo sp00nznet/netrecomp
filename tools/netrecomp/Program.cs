@@ -22,6 +22,11 @@ static class Program
         "I18N.Other", "I18N.West", "I18N.Rare", "Boo.Lang", "UnityScript.Lang", "System.Configuration", "System.Security",
     };
 
+    // Any class-library assembly a player ships (System.ServiceModel, Mono.Data.Sqlite, ...) is
+    // reached by reachability too: compiling it whole drags in types Unity's profile trimmed.
+    static bool IsFramework(string n) => Framework.Contains(n) || n.StartsWith("System.") || n.StartsWith("Mono.")
+        || n.StartsWith("Microsoft.") || n == "Accessibility";
+
     // Types the runtime itself constructs or throws.
     static readonly string[] RuntimeTypes =
     {
@@ -91,7 +96,7 @@ static class Program
         }
         else
         {
-            foreach (var a in w.Asms.Values.Where(a => !Framework.Contains(a.Name.Name)).OrderBy(a => a.Name.Name))
+            foreach (var a in w.Asms.Values.Where(a => !IsFramework(a.Name.Name)).OrderBy(a => a.Name.Name))
                 RootWhole(g, w, a);
         }
         g.Run();
