@@ -120,6 +120,12 @@ static class Program
             if (!t.IsInterface && !t.IsAbstract) g.Construct(tt);
             foreach (var m in t.Methods)
                 if (!m.HasGenericParameters && !m.IsAbstract) g.Root(w.Method(tt, m, none));
+            // Unity calls magic methods (Awake, Update...) by name, private ones on base classes
+            // too, so closed generic bases like MonoBehaviourSingleton<Game> are rooted whole
+            for (var bt = w.BaseOf(tt); bt != null && bt.K == TK.Def; bt = w.BaseOf(bt))
+                if (bt.IsGenericInst)
+                    foreach (var m in bt.Def.Methods)
+                        if (!m.HasGenericParameters && !m.IsAbstract) g.Root(w.Method(bt, m, none));
             // Unity's serializer creates field values like List<T> through their default ctor
             // inherited fields count too: they come from generic bases like Machine<TState>
             for (var bt = tt; bt != null && bt.K == TK.Def; bt = w.BaseOf(bt))

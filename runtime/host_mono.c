@@ -134,12 +134,25 @@ void* nr_pinvoke_fallback(const char* lib, const char* entry)
     return 0;
 }
 
+static void* data_dir_icall(void)
+{
+    char d[MAX_PATH];
+    GetEnvironmentVariableA("NR_DATA_DIR", d, MAX_PATH);
+    CreateDirectoryA(d, 0);
+    return nr_str_utf8(d);
+}
+
 /* Unity's engine calls, by "Namespace.Type::Method" */
 API void mono_add_internal_call(const char* name, const void* fn)
 {
     TR("mono_add_internal_call");
     if (trace_on > 0) nr_log("[mono]   icall %s = exe+0x%x\n", name, (unsigned)((const char*)fn - (const char*)GetModuleHandleA(0)));
-    ensure_init(); nr_add_icall(name, fn);
+    ensure_init();
+    /* NR_DATA_DIR: test runs keep saves out of the player's real profile (from unity2018) */
+    static char data_dir[MAX_PATH];
+    if (!strcmp(name, "UnityEngine.Application::get_persistentDataPath") && GetEnvironmentVariableA("NR_DATA_DIR", data_dir, MAX_PATH))
+    { nr_add_icall(name, (void*)data_dir_icall); return; }
+    nr_add_icall(name, fn);
 }
 
 /* ---- domains ---- */
@@ -824,6 +837,15 @@ API void mono_unity_liveness_stop_gc_world(void) { TR("mono_unity_liveness_stop_
 API void mono_unity_liveness_start_gc_world(void) { TR("mono_unity_liveness_start_gc_world"); GC_enable(); }
 API void mono_unity_liveness_finalize(Liveness* s) { TR("mono_unity_liveness_finalize"); live_flush(s); }
 API void mono_unity_liveness_free_struct(Liveness* s) { TR("mono_unity_liveness_free_struct"); free(s->out); free(s->seen); free(s->work); free(s); }
+/* Unity 4.5 asks for these two as well. The scan already follows every pointer-sized
+   field conservatively, so the IntPtr-scanning class list has nothing to change. */
+API void mono_unity_liveness_mark_classes_for_intptr_scanning(void* classes, int n) { TR("mono_unity_liveness_mark_classes_for_intptr_scanning"); (void)classes; (void)n; }
+API gboolean mono_unity_liveness_has_parent_class(NrClass* k, NrClass* p)
+{
+    TR("mono_unity_liveness_has_parent_class");
+    for (; k; k = k->parent) if (k == p) return 1;
+    return 0;
+}
 
 /* NR_INPUT's "shot PATH": Unity writes the frame itself, at the end of this frame. */
 void nr_shot_take(const char* path)

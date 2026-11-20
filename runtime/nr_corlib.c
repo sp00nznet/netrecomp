@@ -427,6 +427,15 @@ static void Environment_InternalSetEnvironmentVariable(void* name, void* value)
 static void* Environment_GetWindowsFolderPath(int32_t folder)
 {
     wchar_t buf[MAX_PATH];
+    /* NR_DATA_DIR: every special folder (Documents, AppData...) becomes NR_DATA_DIR\<csidl>,
+       so test runs never touch the player's real (often cloud-synced) profile */
+    if (GetEnvironmentVariableW(L"NR_DATA_DIR", buf, MAX_PATH - 16))
+    {
+        CreateDirectoryW(buf, 0);
+        swprintf(buf + wcslen(buf), 16, L"\\%d", folder);
+        CreateDirectoryW(buf, 0);
+        return nr_str_utf16((uint16_t*)buf, (int32_t)wcslen(buf));
+    }
     if (SHGetFolderPathW(0, folder, 0, 0, buf) != 0) return nr_str_utf8("");
     return nr_str_utf16((uint16_t*)buf, (int32_t)wcslen(buf));
 }
