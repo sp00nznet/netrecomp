@@ -583,6 +583,7 @@ static int32_t Marshal_GetLastWin32Error(void) { return (int32_t)GetLastError();
 static int32_t Marshal_SizeOf(void* t)
 {
     NrClass* k = nr_type_class(t);
+    for (int i = 0; i < nr_n_marshal_sizes; i++) if (nr_marshal_sizes[i].klass == k) return nr_marshal_sizes[i].size;
     return nr_value_size(k);
 }
 static intptr_t Marshal_UnsafeAddrOfPinnedArrayElement(void* arr, int32_t idx) { return (intptr_t)((char*)ARR(arr)->vector + (size_t)idx * OBJ(arr)->klass->elem_size); }
@@ -724,6 +725,14 @@ static void Thread_SetCachedCurrentCulture(void* self, void* c) { thread_offsets
 static void* Thread_GetNull(void* self) { (void)self; return 0; }
 static void Thread_SetIgnore(void* self, void* v) { (void)self; (void)v; }
 static int32_t Thread_GetDomainID(void) { return 1; }
+/* No [MarshalAs] metadata is kept: report none (XmlSerializer asks for every field). */
+static void* FieldInfo_GetUnmanagedMarshal(void* self) { (void)self; return 0; }
+/* No machine.config is bundled: System.Configuration then reads the file from disk, or none. */
+static void* InternalConfigurationHost_get_bundled_machine_config(void) { return 0; }
+/* No version resources are read: FileVersionInfo keeps its empty defaults. */
+static void FileVersionInfo_GetVersionInfo_internal(void* self, void* file) { (void)self; (void)file; }
+/* Unity 4.6's corlib numbers managed threads itself (mono 2.6: ids start at 1) */
+static int32_t Thread_GetNewManagedId_internal(void) { static volatile LONG id; return InterlockedIncrement(&id); }
 static void Thread_Thread_free_internal(void* self, intptr_t h) { (void)self; if (h) CloseHandle((HANDLE)h); }
 static void Thread_Sleep_internal(int32_t ms) { Sleep(ms < 0 ? INFINITE : (DWORD)ms); }
 static void Thread_MemoryBarrier(void) { MemoryBarrier(); }
@@ -1454,6 +1463,10 @@ static const NrIcall corlib[] = {
     { "System.Threading.Thread::GetSerializedCurrentUICulture", Thread_GetNull },
     { "System.Threading.Thread::SetSerializedCurrentUICulture", Thread_SetIgnore },
     { "System.Threading.Thread::GetDomainID", Thread_GetDomainID },
+    { "System.Reflection.FieldInfo::GetUnmanagedMarshal", FieldInfo_GetUnmanagedMarshal },
+    { "System.Diagnostics.FileVersionInfo::GetVersionInfo_internal", FileVersionInfo_GetVersionInfo_internal },
+    { "System.Configuration.InternalConfigurationHost::get_bundled_machine_config", InternalConfigurationHost_get_bundled_machine_config },
+    { "System.Threading.Thread::GetNewManagedId_internal", Thread_GetNewManagedId_internal },
     { "System.Threading.Thread::Thread_free_internal", Thread_Thread_free_internal },
     { "System.Threading.Thread::Sleep_internal", Thread_Sleep_internal },
     { "System.Threading.Thread::MemoryBarrier", Thread_MemoryBarrier },

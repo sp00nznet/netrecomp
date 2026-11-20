@@ -807,6 +807,15 @@ sealed class MethodEmitter
         Push(Kind(t), $"*({lay.C(t)}*)nr_unbox({a.n}, &{g.Klass(t)})");
     }
 
+    void NeedDefaultCtor(TT t)
+    {
+        if (t.K != TK.Def || t.IsOpen || t.IsValueType || t.IsInterface || t.Def.IsAbstract) return;
+        var c = t.Def.Methods.FirstOrDefault(c => c.IsConstructor && !c.IsStatic && c.Parameters.Count == 0);
+        if (c == null) return;
+        g.Construct(t);
+        g.Need(w.Method(t, c, Array.Empty<TT>()));
+    }
+
     void Ldtoken(object operand)
     {
         switch (operand)
@@ -814,6 +823,9 @@ sealed class MethodEmitter
             case TypeReference tr:
             {
                 var t = w.Conv(tr, m.Owner.Args, m.MArgs);
+                // typeof(X) is how most code reaches Activator.CreateInstance(Type) (System.Configuration
+                // makes its InternalConfigurationSystem this way): compile X's default ctor.
+                NeedDefaultCtor(t);
                 var h = w.Cor("System", "RuntimeTypeHandle");
                 Push(Kind(h), $"(({lay.C(h)}){{ (intptr_t)nr_class_type(&{g.Klass(t)}) }})");
                 break;
@@ -849,6 +861,10 @@ sealed class MethodEmitter
         var mr = (MethodReference)ins.Operand;
         var t = w.ConvMethod(mr, m.Owner.Args, m.MArgs);
         if (t == null) { ArrayMethod(mr); return; }
+        // new T() compiles to Activator.CreateInstance<T>(), which finds T's default ctor by
+        // reflection: compile it (UnityEngine.UI's ListPool<T> makes List<Canvas> this way).
+        if (t.Def.Name == "CreateInstance" && t.Owner.Def.FullName == "System.Activator" && t.MArgs.Length == 1)
+            NeedDefaultCtor(t.MArgs[0]);
         var args = Args(t, t.Def.Parameters.Count);
         string? self = null;
         TT? selfT = null;
