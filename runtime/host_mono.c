@@ -1,6 +1,6 @@
 /* host_mono.c: the mono embedding API, so the build can stand in for a Unity 4
- * player's Mono/mono.dll. The player resolves exactly these 181 exports by
- * name at start-up (and names any that are missing).
+ * player's Mono/mono.dll. The player resolves these exports by name at start-up
+ * (and names any that are missing): 181 for Unity 4.2/4.3, 206 for 4.6.
  *
  * Handle types map onto runtime records:
  *   MonoDomain*            a static NrDomain (one root, any child is the same world)
@@ -73,7 +73,8 @@ static void ensure_init(void)
 
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
 void nr_input_start(void);
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); return &root_domain; }
+void nr_mute_start(void);
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
@@ -484,9 +485,11 @@ API void mono_runtime_object_init(void* o)
         }
 }
 
+void nr_input_main_tick(void);
 API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, void** exc)
 {
     TR("mono_runtime_invoke");
+    nr_input_main_tick();
     if (!m) { if (exc) *exc = 0; return 0; }
     void* r = nr_invoke(m, obj, params, exc);
     if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
@@ -728,6 +731,99 @@ API void* mono_custom_attrs_get_attr(NrAttrInfo* i, NrClass* k)
     return 0;
 }
 API void mono_custom_attrs_free(NrAttrInfo* i) { TR("mono_custom_attrs_free"); free(i); }
+
+/* ---- added by Unity 4.5/4.6 players ---- */
+
+API void* mono_class_get_userdata(NrClass* k) { TR("mono_class_get_userdata"); return k->unity_userdata; }
+API void mono_class_set_userdata(NrClass* k, void* p) { TR("mono_class_set_userdata"); k->unity_userdata = p; }
+API int mono_class_get_userdata_offset(void) { TR("mono_class_get_userdata_offset"); return (int)offsetof(NrClass, unity_userdata); }
+API uint32_t mono_class_get_type_token(NrClass* k) { TR("mono_class_get_type_token"); return k->token; }
+API NrClass* mono_field_get_parent(const NrFieldDesc* f) { TR("mono_field_get_parent"); return f->parent; }
+API int32_t mono_array_element_size(NrClass* ak) { TR("mono_array_element_size"); return ak->elem_size; }
+API char* mono_array_addr_with_size(NrArray* a, int size, uintptr_t idx) { TR("mono_array_addr_with_size"); return (char*)a->vector + (size_t)size * idx; }
+API void mono_gc_wbarrier_generic_store(void** ptr, void* v) { TR("mono_gc_wbarrier_generic_store"); *ptr = v; }
+/* ponytail: descriptors are only made for methods the build compiled, which are never open
+ * generic definitions; Unity asks to skip those when it scans for messages like Update. */
+API gboolean unity_mono_method_is_generic(const NrMethodDesc* m) { TR("unity_mono_method_is_generic"); (void)m; return 0; }
+API gboolean unity_mono_method_is_inflated(const NrMethodDesc* m) { TR("unity_mono_method_is_inflated"); (void)m; return 0; }
+API void* mono_object_isinst(void* o, NrClass* k) { TR("mono_object_isinst"); return nr_isinst(o, k); }
+API gboolean mono_is_debugger_attached(void) { TR("mono_is_debugger_attached"); return 0; }
+API void* mono_jit_info_table_find(NrDomain* d, void* addr) { TR("mono_jit_info_table_find"); (void)d; (void)addr; return 0; }
+API void* mono_debug_lookup_source_location(const NrMethodDesc* m, uint32_t addr, NrDomain* d) { TR("mono_debug_lookup_source_location"); (void)m; (void)addr; (void)d; return 0; }
+API void mono_debug_free_source_location(void* l) { TR("mono_debug_free_source_location"); (void)l; }
+API void* mono_loader_get_last_error(void) { TR("mono_loader_get_last_error"); return 0; }
+API void* mono_loader_error_prepare_exception(void* e) { TR("mono_loader_error_prepare_exception"); (void)e; return 0; }
+API char* mono_method_full_name(const NrMethodDesc* m, gboolean sig)
+{
+    TR("mono_method_full_name");
+    (void)sig;
+    size_t n = strlen(m->klass->ns) + strlen(m->klass->name) + strlen(m->name) + 4;
+    char* s = (char*)malloc(n);
+    snprintf(s, n, "%s%s%s:%s", m->klass->ns, *m->klass->ns ? "." : "", m->klass->name, m->name);
+    return s;
+}
+/* params is an object[]: value types arrive boxed and are passed by pointer to their data */
+API void* mono_runtime_invoke_array(const NrMethodDesc* m, void* obj, NrArray* params, void** exc)
+{
+    TR("mono_runtime_invoke_array");
+    void* args[64];
+    uint32_t n = params ? params->max_length : 0;
+    for (uint32_t i = 0; i < n && i < 64; i++)
+    {
+        void* a = ((void**)params->vector)[i];
+        NrClass* k = m->params && i < m->n_params ? m->params[i] : 0;
+        args[i] = a && k && (k->flags & NR_VALUETYPE) && !(m->param_byref && m->param_byref[i]) ? (char*)a + sizeof(NrObj) : a;
+    }
+    return nr_invoke(m, obj, args, exc);
+}
+
+void nr_attrs_of(void* provider, const NrAttr** a, int* n);
+static void* attrs_array(const NrAttr* a, int n, NrClass* want)
+{
+    int c = 0, j = 0;
+    for (int i = 0; i < n; i++) if (!want || nr_assignable(want, a[i].klass)) c++;
+    void* arr = nr_newarr(nr_k_objarr, c);
+    for (int i = 0; i < n; i++) if (!want || nr_assignable(want, a[i].klass)) ((void**)((NrArray*)arr)->vector)[j++] = a[i].make();
+    return arr;
+}
+API void* mono_custom_attrs_construct(NrAttrInfo* i) { TR("mono_custom_attrs_construct"); return i ? attrs_array(i->a, i->n, 0) : nr_newarr(nr_k_objarr, 0); }
+/* ponytail: assembly-level attributes aren't in the generated tables; none reported */
+API NrAttrInfo* mono_custom_attrs_from_assembly(NrImage* img) { TR("mono_custom_attrs_from_assembly"); (void)img; return 0; }
+API void* mono_reflection_get_custom_attrs_by_type(void* obj, NrClass* k)
+{
+    TR("mono_reflection_get_custom_attrs_by_type");
+    const NrAttr* a; int n;
+    nr_attrs_of(obj, &a, &n);
+    return attrs_array(a, n, k);
+}
+
+/* Unity 4.6 splits liveness into allocate/stop world/roots/finalize/start world/free. */
+API void* mono_unity_liveness_allocate_struct(NrClass* filter, uint32_t max, LivenessCb cb, void* user)
+{
+    TR("mono_unity_liveness_allocate_struct");
+    Liveness* s = (Liveness*)calloc(1, sizeof *s);
+    s->filter = filter; s->cb = cb; s->user = user;
+    s->max_out = max && max < 64 ? max : 64;
+    s->out = (void**)malloc(s->max_out * sizeof(void*));
+    return s;
+}
+API void mono_unity_liveness_stop_gc_world(void) { TR("mono_unity_liveness_stop_gc_world"); GC_disable(); }
+API void mono_unity_liveness_start_gc_world(void) { TR("mono_unity_liveness_start_gc_world"); GC_enable(); }
+API void mono_unity_liveness_finalize(Liveness* s) { TR("mono_unity_liveness_finalize"); live_flush(s); }
+API void mono_unity_liveness_free_struct(Liveness* s) { TR("mono_unity_liveness_free_struct"); free(s->out); free(s->seen); free(s->work); free(s); }
+
+/* NR_INPUT's "shot PATH": Unity writes the frame itself, at the end of this frame. */
+void nr_shot_take(const char* path)
+{
+    NrClass* k = nr_class_by_name("UnityEngine", "Application");
+    const NrMethodDesc* m = k ? nr_method(k, "CaptureScreenshot", 2) : 0;
+    if (!m) { nr_log("netrecomp: input: no Application.CaptureScreenshot\n"); return; }
+    int32_t scale = 0;
+    void* args[2] = { nr_str_utf8(path), &scale };
+    void* ex = 0;
+    nr_invoke(m, 0, args, &ex);
+    nr_log("netrecomp: input: shot %s%s\n", path, ex ? " (threw)" : "");
+}
 
 /* called by the runtime for exceptions nothing caught on a thread */
 void nr_report_unhandled(void* exc)

@@ -24,7 +24,7 @@ main menu into a level; most of the game is still untested.
 | Translator | Shadowrun Returns (Steam and GOG, 25 assemblies): **88867/88868 methods** lift; the one left is a P/Invoke taking a non-blittable struct |
 | Generated C | all files compile (clang-cl, x86) |
 | Runtime: core, GC, exceptions, threads, file I/O, reflection | conformance tests pass |
-| Runtime: mono embedding API (`mono.dll` for Unity) | Unity 4.2's player boots, renders, loads saves and runs gameplay; scripted input for automated runs |
+| Runtime: mono embedding API (`mono.dll` for Unity) | Unity 4.2, 4.3 and 4.6 players boot, render and run gameplay; scripted input, screenshots and muting for automated runs |
 
 Conformance (current corpus): **9/9 tests** match the real CLR's output and exit code.
 See [Conformance](#conformance).
@@ -32,6 +32,8 @@ See [Conformance](#conformance).
 | Title | Repo | State |
 |---|---|---|
 | Shadowrun Returns (2013, Unity 4.2) | [shadowrun-returns-recomp](https://github.com/sp00nznet/shadowrun-returns-recomp) | in game (Steam): menus, New Game, character creation, loading saves, exploration |
+| Shadowrun: Dragonfall - Director's Cut (2014, Unity 4.3) | shadowrun-dragonfall-recomp (not public yet) | in game (Steam 2.0.9): New Game, character creation, first scene, dialogue. 98416/98417 methods |
+| Shadowrun: Hong Kong - Extended Edition (2015, Unity 4.6) | shadowrun-hongkong-recomp (not public yet) | in game (Steam 3.1.2): New Game, character creation, intro, first scene, dialogue. 111105/111106 methods |
 
 ## Screenshots
 
@@ -86,7 +88,8 @@ py -3 tools\conformance.py --corlib <Managed dir>
   registrations); `NR_TRACE_ICALLS=1` logs every internal call managed code makes;
   `NR_LOG=<file>` sends all of it to a file.
 - `NR_INPUT=<file>` drives the game window from a command file (`click X Y`, `move`,
-  `key VK`, `wait MS`) without touching the real mouse; see `docs/unity-host.md`.
+  `key VK`, `wait MS`, `shot PATH`) without touching the real mouse; see `docs/unity-host.md`.
+- `NR_MUTE=1` mutes the game's own audio session.
 
 ## Conformance
 

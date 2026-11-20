@@ -2,9 +2,22 @@
 
 `runtime/host_mono.c` implements the mono embedding API that a Unity 4 player calls,
 so a netrecomp build can replace `<Game>_Data/Mono/mono.dll`. The player resolves its
-mono functions by name with `GetProcAddress`; for Unity 4.2 that is exactly 180
-`mono_*` functions plus `g_free`, and it logs `mono: function X not found` for any
-that are missing. The list came from the strings in the player executable.
+mono functions by name with `GetProcAddress`; for Unity 4.2 and 4.3 that is exactly 180
+`mono_*` functions plus `g_free`, and Unity 4.6 asks for 206 (including two named
+`unity_mono_*`). It logs `mono: function X not found` for any that are missing. The lists
+came from the strings in the player executables.
+
+## Unity 4.5/4.6 additions
+
+| Export | here |
+|---|---|
+| `mono_class_get_userdata_offset`, `_get_userdata`, `_set_userdata` | `NrClass.unity_userdata`; Unity reads the pointer at that offset directly |
+| `mono_unity_liveness_allocate_struct`, `_stop_gc_world`, `_start_gc_world`, `_finalize`, `_free_struct` | the 4.2 liveness walk split into the steps 4.6 calls (`stop_gc_world` disables the GC, `finalize` flushes) |
+| `mono_runtime_invoke_array` | unboxes value-type arguments from the `object[]` and calls `nr_invoke` |
+| `mono_custom_attrs_construct`, `mono_reflection_get_custom_attrs_by_type` | attribute objects from the generated tables; `mono_custom_attrs_from_assembly` reports none |
+| `mono_method_full_name`, `mono_field_get_parent`, `mono_class_get_type_token`, `mono_object_isinst`, `mono_array_element_size`, `mono_array_addr_with_size`, `mono_gc_wbarrier_generic_store` | direct |
+| `unity_mono_method_is_generic`, `unity_mono_method_is_inflated` | always false: only compiled (closed) methods have descriptors |
+| `mono_is_debugger_attached`, `mono_jit_info_table_find`, `mono_debug_lookup_source_location`, `mono_loader_get_last_error` | nothing to report |
 
 ## Handle types
 
@@ -53,8 +66,20 @@ by token; the records keep each type's metadata token for that.
 With `NR_INPUT=<file>`, the host patches the player's imports of `GetCursorPos`,
 `GetAsyncKeyState` and `GetKeyState` and reads commands from the file as it grows, one per
 line, in client pixels: `move X Y`, `click X Y`, `rclick X Y`, `down`, `up`, `key VK`,
-`wait MS`. The commands post the matching window messages and set the state those imports
+`wait MS`, `shot PATH`. The commands post the matching window messages and set the state those imports
 report, so a game on a hidden or virtual monitor can be played by a script or by appending
 lines by hand, and the real mouse is never moved. Unity 4 takes the pointer position from
 `GetCursorPos`, which is why posting messages from outside the process doesn't work.
 `runtime/unity_input.c`.
+
+`shot PATH` makes the game save its next frame as a PNG: the next `mono_runtime_invoke` on
+the main thread calls the compiled `UnityEngine.Application.CaptureScreenshot`. On a hidden
+desktop (`CreateDesktop`) this is the only capture that works: a GDI grab of the window
+returns whatever is on the real screen. D3D9 can't create a device there either, so run the
+player with `-force-d3d11` (Unity 4.3+).
+
+## Muting (`NR_MUTE`)
+
+`NR_MUTE=1` mutes the process's own audio session (`ISimpleAudioVolume` on the default
+endpoint, before Unity opens a stream), so test runs are silent without touching the system
+volume.

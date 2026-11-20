@@ -6,6 +6,14 @@ versions: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Unity 4.5/4.6 players: the 25 exports they add (class userdata, the split liveness API,
+  `mono_runtime_invoke_array`, attribute construction, `unity_mono_method_is_generic`, ...).
+  Shadowrun: Hong Kong (Unity 4.6.2) lifts 111105/111106 methods and plays into its first
+  scene; Shadowrun: Dragonfall DC (Unity 4.3.4) lifts 98416/98417 and plays into its first
+  scene with no further runtime changes.
+- `NR_INPUT` command `shot PATH`: the game saves its next frame through the compiled
+  `Application.CaptureScreenshot`, so runs on a hidden desktop can be screenshotted.
+- `NR_MUTE=1`: mutes the process's own audio session.
 - `CONTRIBUTING.md`, for going public; README status, screenshots and Getting Started brought up to date.
 - `tools/netrecomp`: IL -> C translator on Mono.Cecil. Full generic instantiation, rapid
   type analysis with generic virtual methods, vtables and interface maps (ECMA-335 II.12.2),

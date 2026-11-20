@@ -97,6 +97,7 @@ struct NrClass {
     void* rt;                 /* runtime-private */
     const NrAttr* cattrs; uint16_t n_cattrs;
     const struct NrRevPool* rev_pool;   /* delegates handed to native code */
+    void* unity_userdata;     /* Unity 4.5+ reads this at mono_class_get_userdata_offset() */
 };
 
 typedef struct NrRevPool { uint32_t* handles; void* const* fns; int32_t n; } NrRevPool;
