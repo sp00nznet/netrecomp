@@ -237,6 +237,10 @@ sealed class Gen
         Canonical(t);
         foreach (var s in L.Slots) if (s != null && !s.Def.IsAbstract) Need(s);
         foreach (var (_, impls) in L.Ifaces) foreach (var s in impls) if (s != null && !s.Def.IsAbstract) Need(s);
+        // anonymous types exist to be read by reflection (Dapper parameters, JSON, string
+        // formatting): compile their property getters
+        if (t.K == TK.Def && t.Def.Name.StartsWith("<>f__AnonymousType"))
+            foreach (var g in t.Def.Methods.Where(x => x.IsGetter && !x.IsStatic)) Need(W.Method(t, g, Array.Empty<TT>()));
         if (t.K == TK.Def)
         {
             var cc = t.Def.Methods.FirstOrDefault(x => x.IsConstructor && x.IsStatic);

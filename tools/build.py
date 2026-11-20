@@ -66,7 +66,11 @@ def main():
         srcs.append(host)
     hdrs = [os.path.join(a.gen, "nrgen.h"), os.path.join(a.gen, "nrcfg.h"), os.path.join(RUNTIME, "nr.h"), os.path.join(RUNTIME, "nrrt.h")]
     hdr_time = max(os.path.getmtime(h) for h in hdrs if os.path.exists(h))
-    flags = ["-m64" if a.arch == "x64" else "-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks", "/EHa", "/W0", "-Wno-everything", "-Werror=implicit-function-declaration",  # an undeclared call returns int: truncates pointers on x64
+    flags = ["-m64" if a.arch == "x64" else "-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks",
+             # a trap after each noreturn call (nr_throw...): otherwise the call can end a block and its
+             # return address land in the next __except landing pad, which SEH counts as inside the
+             # __try, so a function caught its own rethrow and ran a finally twice
+             "/clang:-mllvm", "/clang:-trap-unreachable", "/EHa", "/W0", "-Wno-everything", "-Werror=implicit-function-declaration",  # an undeclared call returns int: truncates pointers on x64
              
              "-ferror-limit=50", "/I", RUNTIME, "/I", a.gen, "/I", os.path.join(GC_DIR, "include"), "/DNR_BUILD"] + GC_DEFS
 

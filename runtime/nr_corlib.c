@@ -754,14 +754,17 @@ static DWORD WINAPI thread_main(LPVOID p)
     StartArgs* a = (StartArgs*)p;
     void* t = nr_gchandle_target(a->h);
     nr_gchandle_free(a->h);
-    SetEvent(a->ready);
-    thread_object_for_current(t);
 #if NR_CORLIB4
-    /* the delegate and argument were captured at start: Start clears m_ThreadStartArg */
+    /* the delegate and argument were captured at start: Start clears m_ThreadStartArg.
+     * Read them before signalling: *a lives on the starting thread's stack. */
     void* d = nr_gchandle_target(a->dh);
     void* arg = a->ah ? nr_gchandle_target(a->ah) : 0;
     nr_gchandle_free(a->dh); if (a->ah) nr_gchandle_free(a->ah);
+    SetEvent(a->ready);
+    thread_object_for_current(t);
 #else
+    SetEvent(a->ready);
+    thread_object_for_current(t);
     void* d = FIELD(t, void*, off_threadstart);
     void* arg = FIELD(t, void*, off_start_obj);
 #endif
@@ -867,6 +870,7 @@ static int64_t IL_Read_i8(int64_t* p) { return InterlockedCompareExchange64((vol
  * are never freed; reclaim them from a finalizer if long runs leak. */
 typedef struct NrMon { CRITICAL_SECTION cs; CONDITION_VARIABLE cv; DWORD owner; int32_t count; } NrMon;
 
+int nr_debug(void);
 static NrMon* mon_of(void* o)
 {
     if (!o) nr_throw_new("System", "ArgumentNullException", "obj");
@@ -897,7 +901,11 @@ static uint8_t Monitor_try_enter(void* o, int32_t ms)
 static void Monitor_Exit(void* o)
 {
     NrMon* m = mon_of(o);
-    if (m->owner != GetCurrentThreadId()) nr_throw_new("System.Threading", "SynchronizationLockException", "Object synchronization method was called from an unsynchronized block of code.");
+    if (m->owner != GetCurrentThreadId())
+    {
+        if (nr_debug()) nr_log("netrecomp: Monitor.Exit on %s.%s %p: owner %lu, this thread %lu, count %d\n", OBJ(o)->klass->ns, OBJ(o)->klass->name, o, m->owner, GetCurrentThreadId(), m->count);
+        nr_throw_new("System.Threading", "SynchronizationLockException", "Object synchronization method was called from an unsynchronized block of code.");
+    }
     if (--m->count == 0) m->owner = 0;
     LeaveCriticalSection(&m->cs);
 }
@@ -2021,6 +2029,14 @@ static int32_t Enum_InternalCompareTo(void* a, void* b)
     return x < y ? -1 : x > y;
 }
 
+/* Enum.HasFlag: (this & flag) == flag on the underlying values */
+static uint8_t Enum_InternalHasFlag(void* self, void* flag)
+{
+    NrClass* u = OBJ(self)->klass->elem;
+    uint64_t x = enum_raw(u, (char*)self + sizeof(NrObj)), f = enum_raw(OBJ(flag)->klass->elem ? OBJ(flag)->klass->elem : u, (char*)flag + sizeof(NrObj));
+    return (x & f) == f;
+}
+
 /* ---- MonoIO: paths arrive as char* (UTF-16, NUL-terminated) ---- */
 static intptr_t MonoIO_Open4(const wchar_t* path, int32_t mode, int32_t access, int32_t share, int32_t options, int32_t* err)
 {
@@ -2229,6 +2245,7 @@ static void nr_register_corlib4_icalls(void)
         { "System.Enum::InternalBoxEnum", Enum_InternalBoxEnum },
         { "System.Enum::InternalGetUnderlyingType", Enum_InternalGetUnderlyingType },
         { "System.Enum::InternalCompareTo", Enum_InternalCompareTo },
+        { "System.Enum::InternalHasFlag", Enum_InternalHasFlag },
         { "System.IO.MonoIO::Open", MonoIO_Open4 },
         { "System.IO.MonoIO::GetFileAttributes", MonoIO_GetFileAttributes4 },
         { "System.IO.MonoIO::SetFileAttributes", MonoIO_SetFileAttributes4 },
