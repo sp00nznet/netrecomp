@@ -44,10 +44,10 @@ static SHORT WINAPI fake_GetKeyState(int vk)
     return real_GetKeyState(vk);
 }
 
-/* Swap one import of the main executable; returns the old target. */
-static void* patch_import(const char* dll, const char* fn, void* repl)
+/* Swap one import of a module; returns the old target. */
+static void* patch_import1(char* base, const char* dll, const char* fn, void* repl)
 {
-    char* base = (char*)GetModuleHandleA(0);
+    if (!base) return 0;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     for (IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); d->Name; d++)
@@ -68,6 +68,13 @@ static void* patch_import(const char* dll, const char* fn, void* repl)
         }
     }
     return 0;
+}
+/* Unity 4's player code is the executable; 2017+ keeps it in UnityPlayer.dll. */
+static void* patch_import(const char* dll, const char* fn, void* repl)
+{
+    void* a = patch_import1((char*)GetModuleHandleA(0), dll, fn, repl);
+    void* b = patch_import1((char*)GetModuleHandleA("UnityPlayer.dll"), dll, fn, repl);
+    return a ? a : b;
 }
 
 static BOOL CALLBACK find_window(HWND h, LPARAM lp)

@@ -106,7 +106,7 @@ NrClass* nr_array_class(NrClass* elem, int rank)
     k->name = nm; k->ns = elem->ns; k->image = elem->image;
     k->parent = nr_k_array; k->elem = elem; k->cast_class = (elem->flags & NR_ENUM) ? elem->elem : elem;
     k->rank = (uint16_t)rank; k->flags = NR_ARRAY | NR_SEALED | NR_CONSTRUCTED | ((nr_is_ref(elem) || (elem->flags & NR_HAS_REFS)) ? NR_HAS_REFS : 0);
-    k->instance_size = 16; k->value_size = sizeof(void*); k->elem_size = nr_value_size(elem);
+    k->instance_size = (int32_t)offsetof(NrArray, vector); k->value_size = sizeof(void*); k->elem_size = nr_value_size(elem);
     static NrClass* sup[3];
     NrClass** s = (NrClass**)malloc(sizeof(NrClass*) * 3);
     s[0] = nr_k_object; s[1] = nr_k_array; s[2] = k;
@@ -146,7 +146,7 @@ void* nr_new(NrClass* k)
 void* nr_newarr(NrClass* k, int32_t n)
 {
     if (n < 0) nr_throw_overflow();
-    uint64_t size = 16 + (uint64_t)k->elem_size * (uint32_t)n;
+    uint64_t size = offsetof(NrArray, vector) + (uint64_t)k->elem_size * (uint32_t)n;
     if (size > 0x7fffffff) nr_throw_new("System", "OutOfMemoryException", "Array too large");
     NrArray* a = (NrArray*)gc_alloc(k, (size_t)size);
     a->max_length = (uint32_t)n;
@@ -157,7 +157,7 @@ void* nr_new_mdarray(NrClass* k, int rank, const int32_t* lens)
 {
     uint64_t total = 1;
     for (int i = 0; i < rank; i++) { if (lens[i] < 0) nr_throw_overflow(); total *= (uint32_t)lens[i]; }
-    uint64_t data = 16 + (uint64_t)k->elem_size * total;
+    uint64_t data = offsetof(NrArray, vector) + (uint64_t)k->elem_size * total;
     data = (data + 7) & ~7ull;
     uint64_t size = data + sizeof(NrBounds) * rank;
     if (size > 0x7fffffff) nr_throw_new("System", "OutOfMemoryException", "Array too large");
@@ -220,9 +220,19 @@ void* nr_unbox(void* o, NrClass* k)
 
 static int implements(NrClass* c, NrClass* iface)
 {
+    NrClass* c0 = c;
     for (; c; c = c->parent)
         for (int i = 0; i < c->n_ifaces; i++)
             if (c->ifaces[i].iface == iface) return 1;
+    /* a runtime-built reference array: as a compiled array of a base element type (see nr_iface) */
+    if ((c0->flags & NR_ARRAY) && c0->rank == 1 && c0->elem && nr_is_ref(c0->elem))
+        for (NrClass* e = c0->elem->parent; e; e = e->parent)
+            for (int i = 0; i < nr_n_classes; i++)
+            {
+                NrClass* a = nr_classes[i];
+                if ((a->flags & NR_ARRAY) && a->elem == e && a->rank == 1 && a != c0)
+                    for (int j = 0; j < a->n_ifaces; j++) if (a->ifaces[j].iface == iface) return 1;
+            }
     return 0;
 }
 
@@ -273,6 +283,19 @@ void* nr_iface(void* o, NrClass* iface, int k)
             if (!fn) break;
             return fn;
         }
+    /* An array class the runtime built (no generic interfaces): a reference
+     * array is covariant and laid out alike, so borrow the interface from a
+     * compiled array of a base element type (MonoAssembly[] -> Assembly[]). */
+    if ((c->flags & NR_ARRAY) && c->rank == 1 && c->elem && nr_is_ref(c->elem))
+        for (NrClass* e = c->elem->parent; e; e = e->parent)
+            for (int i = 0; i < nr_n_classes; i++)
+            {
+                NrClass* a = nr_classes[i];
+                if (!(a->flags & NR_ARRAY) || a->elem != e || a->rank != 1 || a == c) continue;
+                for (int j = 0; j < a->n_ifaces; j++)
+                    if (a->ifaces[j].iface == iface && a->ifaces[j].offset >= 0 && a->vtable[a->ifaces[j].offset + k])
+                        return a->vtable[a->ifaces[j].offset + k];
+            }
     char msg[512];
     _snprintf(msg, sizeof msg, "%s.%s does not implement %s.%s method %d", c->ns, c->name, iface->ns, iface->name, k);
     msg[sizeof msg - 1] = 0;
@@ -330,6 +353,7 @@ void nr_throw_new(const char* ns, const char* name, const char* msg)
 int nr_debug(void);
 void nr_print_stack(int skip);
 void nr_print_addr(void* addr);
+void nr_print_ctx_stack(CONTEXT* c);
 
 void nr_throw(void* exc)
 {
@@ -370,7 +394,7 @@ void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
     switch (r->ExceptionCode)
     {
     case EXCEPTION_ACCESS_VIOLATION:
-        if (nr_debug()) { nr_log("netrecomp: access violation at %p (address %p)\n", r->ExceptionAddress, (void*)r->ExceptionInformation[1]); nr_print_addr(r->ExceptionAddress); }
+        if (nr_debug()) { nr_log("netrecomp: access violation at %p (address %p)\n", r->ExceptionAddress, (void*)r->ExceptionInformation[1]); nr_print_ctx_stack(ep->ContextRecord); }
         name = "NullReferenceException"; msg = "Object reference not set to an instance of an object"; break;
     case EXCEPTION_INT_DIVIDE_BY_ZERO: name = "DivideByZeroException"; msg = "Division by zero"; break;
     case EXCEPTION_INT_OVERFLOW: name = "ArithmeticException"; msg = "Overflow"; break;
@@ -431,7 +455,7 @@ int nr_catch_any(struct _EXCEPTION_POINTERS* ep, NrClass* const* ks, int n, void
 NrString* nr_str_alloc(int32_t len)
 {
     if (len < 0) nr_throw_overflow();
-    size_t size = 12 + 2 * ((size_t)len + 1);
+    size_t size = offsetof(NrString, chars) + 2 * ((size_t)len + 1);
     NrString* s = (NrString*)GC_MALLOC_ATOMIC(size);
     if (!s) nr_throw_new("System", "OutOfMemoryException", "Out of memory");
     memset(s, 0, size);
@@ -485,7 +509,7 @@ void* nr_strlit(int i)
     if (!nr_strtab[i])
     {
         const NrStrLit* l = &nr_strlits[i];
-        size_t size = 12 + 2 * ((size_t)l->len + 1);
+        size_t size = offsetof(NrString, chars) + 2 * ((size_t)l->len + 1);
         NrString* s = (NrString*)GC_MALLOC_UNCOLLECTABLE(size);
         memset(s, 0, size);
         s->o.klass = nr_k_string;
@@ -931,7 +955,7 @@ void nr_init(void)
     nr_k_object = need("System", "Object");
     nr_k_string = need("System", "String");
     nr_k_array = need("System", "Array");
-    nr_k_monotype = need("System", "MonoType");
+    nr_k_monotype = need("System", NR_CORLIB4 ? "RuntimeType" : "MonoType");   /* the class of type objects */
     nr_k_void = need("System", "Void");
     nr_k_int32 = need("System", "Int32");
     nr_k_bool = need("System", "Boolean");
@@ -954,6 +978,10 @@ void nr_init(void)
         if ((k->flags & NR_ARRAY) && k->rank == 1 && k->byval_arg.type == 0x1d && k->elem) k->elem->szarray = k;
     }
     nr_k_objarr = nr_array_class(nr_k_object, 1);
+    /* the 4.x String has no cctor: the runtime sets String.Empty, as mono's does */
+    const NrFieldDesc* empty = nr_field(nr_k_string, "Empty");
+    if (empty && (empty->flags & 0x10) && nr_k_string->statics && !*(void**)((char*)nr_k_string->statics + empty->offset))
+        *(void**)((char*)nr_k_string->statics + empty->offset) = nr_str_alloc(0);
     nr_register_corlib_icalls();
     nr_thread_attach();
 }
@@ -992,7 +1020,7 @@ static DWORD WINAPI watch_set(void* th)
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     SuspendThread(th);
     GetThreadContext(th, &c);
-    c.Dr0 = (DWORD)(uintptr_t)watch_addr;
+    c.Dr0 = (uintptr_t)watch_addr;
     c.Dr7 = (c.Dr7 & ~0xF0003u) | 1u | (1u << 16) | (3u << 18);   /* L0, write, 4 bytes */
     SetThreadContext(th, &c);
     ResumeThread(th);
@@ -1024,7 +1052,9 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
-        && r->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && r->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+        && r->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && r->ExceptionCode != EXCEPTION_STACK_OVERFLOW
+        && r->ExceptionCode != 0xC0000374u /* heap corruption */) return EXCEPTION_CONTINUE_SEARCH;
+    if (r->ExceptionCode == 0xC0000374u) { nr_log("netrecomp: heap corruption, thread %lu\n", GetCurrentThreadId()); nr_print_ctx_stack(ep->ContextRecord); return EXCEPTION_CONTINUE_SEARCH; }
     HMODULE self = (HMODULE)&__ImageBase, at = 0;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r->ExceptionAddress, &at);
     if (at == self) return EXCEPTION_CONTINUE_SEARCH;
@@ -1034,9 +1064,15 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
     mod_off(r->ExceptionAddress, where, sizeof where);
     nr_log("netrecomp: fault 0x%08lx at %s (data %p) thread %lu\n", r->ExceptionCode, where,
            r->NumberParameters > 1 ? (void*)r->ExceptionInformation[1] : 0, GetCurrentThreadId());
+#ifdef _WIN64
+    nr_log("  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx rsp=%llx r8=%llx r9=%llx\n",
+           c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp, c->R8, c->R9);
+    uintptr_t* sp = (uintptr_t*)c->Rsp;
+#else
     nr_log("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx ebp=%08lx esp=%08lx\n",
            c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
     uintptr_t* sp = (uintptr_t*)c->Esp;
+#endif
     if (!IsBadReadPtr(sp, 16)) nr_log("  [esp] %08lx %08lx %08lx %08lx\n", (unsigned long)sp[0], (unsigned long)sp[1], (unsigned long)sp[2], (unsigned long)sp[3]);
     /* the words around esp, each named: module+offset or GC object class */
     for (int i = -16; i < 48; i++)
@@ -1049,7 +1085,7 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS* ep)
         if ((uintptr_t)v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)v, &m) && m) mod_off(v, buf, sizeof buf);
         else if ((uintptr_t)v > 0x10000 && GC_base(v) == v && !IsBadReadPtr(v, 4) && *(NrClass**)v && !IsBadReadPtr(*(NrClass**)v, sizeof(NrClass)) && (*(NrClass**)v)->self == *(NrClass**)v)
             _snprintf(buf, sizeof buf, "obj %s", (*(NrClass**)v)->name);
-        nr_log("  %c%+04x %08lx %s\n", i ? ' ' : '>', i * 4, (unsigned long)*w, buf);
+        nr_log("  %c%+04x %p %s\n", i ? ' ' : '>', i * (int)sizeof(void*), v, buf);
     }
     /* where an address outside every module lives: GC object (and class) or which region */
     void* probe[2] = { r->ExceptionAddress, IsBadReadPtr(sp, 4) ? 0 : (void*)sp[0] };
@@ -1114,6 +1150,28 @@ void nr_print_addr(void* addr)
     else nr_log("    %p\n", addr);
 }
 
+/* The stack of a faulting thread, unwound from its context (the handler's
+ * own stack ends at the exception dispatcher on x64). */
+void nr_print_ctx_stack(CONTEXT* ctx)
+{
+    if (!nr_debug()) return;
+#ifdef _WIN64
+    CONTEXT c = *ctx;
+    EnterCriticalSection(&dbg_lock);
+    for (int i = 0; i < 40 && c.Rip; i++)
+    {
+        nr_print_addr((void*)c.Rip);
+        DWORD64 base; void* hd; DWORD64 frame;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, 0);
+        if (!f) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &frame, 0);
+    }
+    LeaveCriticalSection(&dbg_lock);
+#else
+    nr_print_addr((void*)ctx->Eip);
+#endif
+}
+
 void nr_print_stack(int skip)
 {
     if (!nr_debug()) return;
@@ -1168,6 +1226,7 @@ void nr_async_callback(void* cb)
  * pointer from the frame, so a cdecl callee (which leaves its arguments) and
  * a stdcall one (which pops them) both come back right. The integer result is
  * edx:eax; the _fp variant returns the x87 st(0) the callee left. */
+#ifndef _WIN64   /* x64 P/Invokes call directly (one calling convention) */
 __declspec(naked) int64_t nr_native_call(void* fn, const uint32_t* args, int32_t n)
 {
     __asm {
@@ -1213,3 +1272,4 @@ __declspec(naked) double nr_native_call_fp(void* fn, const uint32_t* args, int32
         ret
     }
 }
+#endif

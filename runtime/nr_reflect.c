@@ -491,9 +491,11 @@ static void MonoMethodInfo_get_method_info(intptr_t h, void** info)
     const NrMethodDesc* m = (const NrMethodDesc*)h;
     info[0] = nr_type_object(m->klass);
     info[1] = m->ret ? nr_type_object(m->ret) : 0;
-    ((int32_t*)info)[2] = m->flags;
-    ((int32_t*)info)[3] = m->iflags;
-    ((int32_t*)info)[4] = (m->flags & 0x10) ? 1 : 0x21;
+    /* MonoMethodInfo { Type parent, ret; int attrs, iattrs, callconv; }: the ints follow two pointers */
+    int32_t* ints = (int32_t*)&info[2];
+    ints[0] = m->flags;
+    ints[1] = m->iflags;
+    ints[2] = (m->flags & 0x10) ? 1 : 0x21;
 }
 static void* MonoMethodInfo_get_parameter_info(intptr_t h, void* member)
 {
@@ -604,7 +606,7 @@ static void MonoPropertyInfo_get_property_info(void* prop, void** info, int32_t 
     info[1] = nr_str_utf8(p->name);
     info[2] = p->get ? nr_method_object(p->get) : 0;
     info[3] = p->set ? nr_method_object(p->set) : 0;
-    ((int32_t*)info)[4] = 0;
+    *(int32_t*)&info[4] = 0;   /* attrs, after four pointers */
 }
 static void* MonoPropertyInfo_GetTypeModifiers(void* prop, uint8_t opt) { (void)prop; (void)opt; return 0; }
 
@@ -711,7 +713,7 @@ static void* AppDomain_LoadAssembly(void* self, void* name, void* ev, uint8_t re
 static void* AppDomain_GetAssemblies(void* self, uint8_t refonly)
 {
     (void)self; (void)refonly;
-    void* a = new_array(k_assembly, nr_n_images);
+    void* a = new_array(nr_class_by_name("System.Reflection", "Assembly"), nr_n_images);
     for (int i = 0; i < nr_n_images; i++) adata(a)[i] = assembly_object(nr_images[i]);
     return a;
 }
@@ -762,6 +764,369 @@ static void* Delegate_CreateDelegate_internal(void* type, void* target, void* mi
     return d;
 }
 static void Delegate_SetMulticastInvoke(void* self) { (void)self; }
+
+
+/* ==== mono 4.x reflection (Unity 2017+) ====
+ * Type objects are System.RuntimeType. Member queries return GPtrArrays of
+ * native handles (MonoMethod*, MonoProperty*, ...), which the class library
+ * turns into objects through the *_from_handle icalls. */
+#if NR_CORLIB4
+typedef struct GPtrArr { void** pdata; uint32_t len; } GPtrArr;
+static GPtrArr* gpa_new(void) { GPtrArr* a = (GPtrArr*)calloc(1, sizeof *a); return a; }
+static void gpa_add(GPtrArr* a, const void* p)
+{
+    if ((a->len & 15) == 0) a->pdata = (void**)realloc(a->pdata, sizeof(void*) * (a->len + 16));
+    a->pdata[a->len++] = (void*)p;
+}
+static int name_eq8(const char* a, intptr_t utf8, int ic)
+{
+    if (!utf8) return 1;
+    return ic ? !_stricmp(a, (const char*)utf8) : !strcmp(a, (const char*)utf8);
+}
+
+static intptr_t RT_GetMethodsByName_native(void* self, intptr_t name, int32_t bf, uint8_t ic)
+{
+    NrClass* k = K(self);
+    GPtrArr* a = gpa_new();
+    for (NrClass* c = k; c; c = (bf & 2) ? 0 : c->parent)
+        for (int i = 0; i < c->n_methods; i++)
+        {
+            const NrMethodDesc* m = &c->methods[i];
+            if (!m->name || is_ctor(m) || !bind_ok(m->flags, bf, c != k) || !name_eq8(m->name, name, ic)) continue;
+            int hidden = 0;
+            if (c != k && m->slot >= 0)
+                for (uint32_t j = 0; j < a->len && !hidden; j++) { const NrMethodDesc* o = (const NrMethodDesc*)a->pdata[j]; hidden = o->slot == m->slot && !strcmp(o->name, m->name); }
+            if (!hidden) gpa_add(a, m);
+        }
+    return (intptr_t)a;
+}
+static intptr_t RT_GetConstructors_native(void* self, int32_t bf)
+{
+    NrClass* k = K(self);
+    GPtrArr* a = gpa_new();
+    for (int i = 0; i < k->n_methods; i++) if (!strcmp(k->methods[i].name, ".ctor") && bind_ok(k->methods[i].flags, bf, 0)) gpa_add(a, &k->methods[i]);
+    return (intptr_t)a;
+}
+static intptr_t RT_GetFields_native(void* self, intptr_t name, int32_t bf)
+{
+    NrClass* k = K(self);
+    GPtrArr* a = gpa_new();
+    for (NrClass* c = k; c; c = (bf & 2) ? 0 : c->parent)
+        for (int i = 0; i < c->n_fields; i++)
+            if (bind_ok(c->fields[i].flags, bf, c != k) && name_eq8(c->fields[i].name, name, bf & 1)) gpa_add(a, &c->fields[i]);
+    return (intptr_t)a;
+}
+static intptr_t RT_GetPropertiesByName_native(void* self, intptr_t name, int32_t bf, uint8_t ic)
+{
+    NrClass* k = K(self);
+    GPtrArr* a = gpa_new();
+    for (NrClass* c = k; c; c = (bf & 2) ? 0 : c->parent)
+    {
+        int np; const NrProp* ps = nr_props_of(c, &np);
+        for (int i = 0; i < np; i++)
+        {
+            if (!bind_ok(prop_attrs(&ps[i]), bf, c != k) || !name_eq8(ps[i].name, name, ic)) continue;
+            int dup = 0;
+            for (uint32_t j = 0; j < a->len; j++) dup |= !strcmp(((const NrProp*)a->pdata[j])->name, ps[i].name);
+            if (!dup) gpa_add(a, &ps[i]);
+        }
+    }
+    return (intptr_t)a;
+}
+static intptr_t RT_GetEvents_native(void* self, intptr_t name, int32_t bf) { (void)self; (void)name; (void)bf; return (intptr_t)gpa_new(); }
+static intptr_t RT_GetNestedTypes_native(void* self, intptr_t name, int32_t bf)
+{
+    NrClass* k = K(self);
+    GPtrArr* a = gpa_new();
+    for (int i = 0; i < nr_n_classes; i++)
+    {
+        NrClass* c = nr_classes[i];
+        if (c->nested_in != k || !name_eq8(c->name, name, bf & 1)) continue;
+        int pub = (c->attrs & 7) == 2;   /* NestedPublic */
+        if ((pub && (bf & 16)) || (!pub && (bf & 32))) gpa_add(a, &c->byval_arg);
+    }
+    return (intptr_t)a;
+}
+static void* MethodBase_GetMethodFromHandleInternalType_native(intptr_t h, intptr_t t, uint8_t gc) { (void)t; (void)gc; return nr_method_object((const NrMethodDesc*)h); }
+static void* PropertyInfo_internal_from_handle_type(intptr_t h, intptr_t t) { (void)t; return h ? prop_object((const NrProp*)h) : 0; }
+static void* EventInfo_internal_from_handle_type(intptr_t h, intptr_t t) { (void)h; (void)t; return 0; }
+
+/* RuntimeTypeHandle: statics over a RuntimeType */
+static int32_t RTH_GetAttributes(void* t) { return (int32_t)K(t)->attrs; }
+static void* RTH_GetBaseType(void* t) { return MonoType_get_BaseType(t); }
+static void* RTH_GetElementType(void* t) { return MonoType_GetElementType(t); }
+static int32_t RTH_GetArrayRank(void* t) { return K(t)->rank; }
+static int32_t RTH_GetMetadataToken(void* t) { return (int32_t)K(t)->token; }
+static uint8_t RTH_HasInstantiation(void* t) { return (K(t)->flags & NR_GENERIC_INST) != 0; }
+static uint8_t RTH_IsGenericTypeDefinition(void* t) { return Type_get_IsGenericTypeDefinition(t); }
+static uint8_t RTH_false(void* t) { (void)t; return 0; }
+static intptr_t RTH_GetGenericParameterInfo(void* t) { (void)t; return 0; }
+static void* RTH_GetGenericTypeDefinition_impl(void* t) { return Type_GetGenericTypeDefinition_impl(t); }
+static uint8_t RTH_IsArray(void* t) { return (K(t)->flags & NR_ARRAY) != 0; }
+static uint8_t RTH_IsByRef(void* t) { return (uint8_t)nr_type_byref(t); }
+static uint8_t RTH_IsPointer(void* t) { return (K(t)->flags & NR_POINTER) != 0; }
+static uint8_t RTH_IsPrimitive(void* t) { return MonoType_IsPrimitiveImpl(t); }
+static uint8_t RTH_HasReferences(void* t) { NrClass* k = K(t); return nr_is_ref(k) || (k->flags & NR_HAS_REFS) != 0; }
+static uint8_t RTH_IsInstanceOfType(void* t, void* o) { return nr_isinst(o, K(t)) != 0; }
+static uint8_t RTH_type_is_assignable_from(void* a, void* b) { return nr_assignable(K(a), K(b)); }
+static int32_t RTH_GetCorElementType(void* t) { return K(t)->byval_arg.type; }
+static void* RTH_GetAssembly(void* t) { return assembly_object(K(t)->image); }
+static void* module_object(NrImage* img);
+static void* RTH_GetModule(void* t) { return module_object(K(t)->image); }
+
+/* RuntimeType instance and static icalls */
+static void* RT_GetGenericArgumentsInternal(void* self, uint8_t runtime)
+{
+    void* a = MonoType_GetGenericArguments(self);
+    if (!runtime) return a;
+    /* the runtime array is RuntimeType[]: the class library casts it */
+    int n = (int)ARR(a)->max_length;
+    void* r = new_array(nr_k_monotype, n);
+    memcpy(adata(r), adata(a), sizeof(void*) * (size_t)n);
+    return r;
+}
+static int32_t RT_GetGenericParameterPosition(void* self) { (void)self; return -1; }
+static void* RT_MakePointerType(void* t) { (void)t; nr_throw_notsupported("Type.MakePointerType"); }
+static int32_t RT_GetTypeCodeImplInternal(void* t) { return Type_GetTypeCodeInternal(t); }
+static void* RT_CreateInstanceInternal(void* t) { return Activator_CreateInstanceInternal(t); }
+static int32_t RT_security_level(void* self) { (void)self; return 0; }
+static uint8_t RT_static_false(void* t) { (void)t; return 0; }
+static void RT_GetInterfaceMapData(void* t, void* iface, void** targets, void** methods)
+{
+    NrClass* k = K(t); NrClass* ik = K(iface);
+    NrClass* mk = nr_class_by_name("System.Reflection", "MethodInfo");
+    int n = 0;
+    for (int i = 0; i < ik->n_methods; i++) if (ik->methods[i].slot >= 0) n++;
+    void* ta = new_array(mk, n); void* ma = new_array(mk, n);
+    int off = -1;
+    for (NrClass* c = k; c && off < 0; c = c->parent)
+        for (int i = 0; i < c->n_ifaces; i++) if (c->ifaces[i].iface == ik) { off = c->ifaces[i].offset; break; }
+    int j = 0;
+    for (int i = 0; i < ik->n_methods; i++)
+    {
+        const NrMethodDesc* im = &ik->methods[i];
+        if (im->slot < 0) continue;
+        adata(ma)[j] = nr_method_object(im);
+        void* fn = off >= 0 ? k->vtable[off + im->slot] : 0;
+        for (NrClass* c = k; c && fn && !adata(ta)[j]; c = c->parent)
+            for (int q = 0; q < c->n_methods; q++) if (c->methods[q].fn == fn) { adata(ta)[j] = nr_method_object(&c->methods[q]); break; }
+        j++;
+    }
+    *targets = ta; *methods = ma;
+}
+
+/* members */
+static int32_t MonoMethodInfo_get_method_attributes(intptr_t h) { return ((const NrMethodDesc*)h)->flags; }
+static void* MonoMethod_get_name4(void* m) { return MonoMethod_get_name(m); }
+static void* MonoMethod_self(void* m) { return m; }
+static void* MonoMethod_get_base_method(void* m, uint8_t definition) { (void)definition; return m; }
+static void* MonoMethod_MakeGenericMethod_impl(void* m, void* types) { (void)m; (void)types; nr_throw_notsupported("MethodInfo.MakeGenericMethod"); }
+static int32_t MonoMethod_GetPInvoke(void* m, int32_t* flags, void** entry, void** dll) { (void)m; *flags = 0; *entry = 0; *dll = 0; return 0; }
+static void* MonoField_ResolveType(void* self) { return nr_type_object(GETF(self, const NrFieldDesc*, k_monofield, "fhandle")->type); }
+static void* empty_types(void) { return new_array(nr_class_by_name("System", "Type"), 0); }
+static void* FieldInfo_GetTypeModifiers(void* self, uint8_t opt) { (void)self; (void)opt; return empty_types(); }
+static void* FieldInfo_get_marshal_info(void* self) { (void)self; return 0; }
+static int32_t ParameterInfo_GetMetadataToken(void* self) { (void)self; return 0x08000000; }
+static void* ParameterInfo_GetTypeModifiers(void* self, uint8_t opt) { (void)self; (void)opt; return empty_types(); }
+static int32_t Module_get_MetadataToken(void* m) { (void)m; return 0x00000001; }
+static void* MonoCustomAttrs_GetCustomAttributesDataInternal(void* obj) { (void)obj; return new_array(nr_class_by_name("System.Reflection", "CustomAttributeData"), 0); }
+static void* MonoPropertyInfo_get_default_value(void* p) { (void)p; return 0; }
+
+/* MonoPropertyInfo { Type parent; Type declaring_type; string name; MethodInfo get, set; PropertyAttributes attrs; } */
+static void MonoPropertyInfo_get_property_info4(void* prop, void** info, int32_t req)
+{
+    (void)req;
+    const NrProp* p = GETF(prop, const NrProp*, k_monoproperty, "prop");
+    info[0] = nr_type_object(p->klass);
+    info[1] = nr_type_object(p->klass);
+    info[2] = nr_str_utf8(p->name);
+    info[3] = p->get ? nr_method_object(p->get) : 0;
+    info[4] = p->set ? nr_method_object(p->set) : 0;
+    ((int32_t*)&info[5])[0] = 0;
+}
+
+/* assemblies and modules */
+typedef struct MonoAsmName {
+    const char* name; const char* culture; const char* hash_value; const uint8_t* public_key;
+    uint8_t public_key_token[17]; uint32_t hash_alg, hash_len, flags;
+    uint16_t major, minor, build, revision, arch;
+} MonoAsmName;
+static void asm_version(const char* full, uint16_t* v)
+{
+    int x[4] = { 0, 0, 0, 0 };
+    const char* p = full ? strstr(full, "Version=") : 0;
+    if (p) sscanf(p + 8, "%d.%d.%d.%d", &x[0], &x[1], &x[2], &x[3]);
+    for (int i = 0; i < 4; i++) v[i] = (uint16_t)x[i];
+}
+static void* AssemblyName_GetNativeName(intptr_t asm_ptr)
+{
+    NrImage* img = (NrImage*)asm_ptr;
+    if (!img) return 0;
+    void* c = cache_get((char*)img + 1);
+    if (c) return c;
+    MonoAsmName* n = (MonoAsmName*)calloc(1, sizeof *n);
+    n->name = img->name; n->culture = "";
+    uint16_t v[4]; asm_version(img->fullname, v);
+    n->major = v[0]; n->minor = v[1]; n->build = v[2]; n->revision = v[3];
+    const char* t = img->fullname ? strstr(img->fullname, "PublicKeyToken=") : 0;
+    if (t && strncmp(t + 15, "null", 4)) memcpy(n->public_key_token, t + 15, 16);
+    return cache_put((char*)img + 1, n);
+}
+/* "Name, Version=1.2.3.4, Culture=neutral, PublicKeyToken=abcd..." */
+static uint8_t AssemblyName_ParseAssemblyName(intptr_t utf8, MonoAsmName* out, uint8_t* has_ver, uint8_t* has_tok)
+{
+    memset(out, 0, sizeof *out);
+    *has_ver = 0; *has_tok = 0;
+    const char* s = (const char*)utf8;
+    if (!s || !*s) return 0;
+    const char* c = strchr(s, ',');
+    size_t n = c ? (size_t)(c - s) : strlen(s);
+    while (n && s[n - 1] == ' ') n--;
+    char* nm = (char*)malloc(n + 1); memcpy(nm, s, n); nm[n] = 0;
+    out->name = nm;
+    if (strstr(s, "Version=")) { uint16_t v[4]; asm_version(s, v); out->major = v[0]; out->minor = v[1]; out->build = v[2]; out->revision = v[3]; *has_ver = 1; }
+    const char* t = strstr(s, "PublicKeyToken=");
+    if (t) { *has_tok = 1; if (strncmp(t + 15, "null", 4)) memcpy(out->public_key_token, t + 15, 16); }
+    const char* cu = strstr(s, "Culture=");
+    if (cu) { const char* e = strchr(cu, ','); size_t l = e ? (size_t)(e - cu - 8) : strlen(cu + 8); char* x = (char*)malloc(l + 1); memcpy(x, cu + 8, l); x[l] = 0; if (!_stricmp(x, "neutral")) x[0] = 0; out->culture = x; }
+    return 1;
+}
+static void RuntimeMarshal_FreeAssemblyName(MonoAsmName* n, uint8_t free_struct)
+{
+    free((void*)n->name); free((void*)n->culture);
+    n->name = 0; n->culture = 0;
+    if (free_struct) free(n);
+}
+static void AssemblyName_get_public_token(uint8_t* token, uint8_t* pk, int32_t len) { (void)pk; (void)len; memset(token, 0, 8); }
+
+static void* module_object(NrImage* img)
+{
+    if (!img || !k_module) return 0;
+    void* m = cache_get((char*)img + 2);
+    if (m) return m;
+    m = nr_new(k_module);
+    SETF(m, NrImage*, k_module, "_impl", img);
+    SETF(m, void*, k_module, "assembly", assembly_object(img));
+    SETF(m, void*, k_module, "name", nr_str_utf8(img->file));
+    SETF(m, void*, k_module, "scopename", nr_str_utf8(img->file));
+    SETF(m, void*, k_module, "fqname", Assembly_get_location(assembly_object(img)));
+    return cache_put((char*)img + 2, m);
+}
+static void* Assembly_GetManifestModuleInternal(void* self) { return module_object(asm_image(self)); }
+static void* Assembly_GetModulesInternal(void* self)
+{
+    void* a = new_array(nr_class_by_name("System.Reflection", "Module"), 1);
+    adata(a)[0] = module_object(asm_image(self));
+    return a;
+}
+static void* Assembly_GetFilesInternal(void* self, void* name, uint8_t res) { (void)self; (void)name; (void)res; return 0; }
+static void* Assembly_GetAotId(void) { return 0; }
+static intptr_t Assembly_InternalGetReferencedAssemblies(void* a) { (void)a; return (intptr_t)gpa_new(); }
+static uint8_t Assembly_GetManifestResourceInfoInternal(void* self, void* name, void* info) { (void)self; (void)name; (void)info; return 0; }
+static void* Assembly_load_with_partial_name(void* name, void* ev) { (void)ev; return Assembly_load(name); }
+static uint8_t Assembly_LoadPermissions(void* a, intptr_t* m, int32_t* ml, intptr_t* o, int32_t* ol, intptr_t* r, int32_t* rl) { (void)a; *m = 0; *ml = 0; *o = 0; *ol = 0; *r = 0; *rl = 0; return 0; }
+static uint8_t Assembly_get_global_assembly_cache(void* self) { (void)self; return 0; }
+static void* AppDomain_LoadAssemblyRaw(void* self, void* raw, void* sym, void* ev, uint8_t refonly) { (void)self; (void)raw; (void)sym; (void)ev; (void)refonly; nr_throw_notsupported("Assembly.Load(byte[])"); }
+static void* MissingMemberException_FormatSignature(void* sig) { (void)sig; return nr_str_utf8("?"); }
+static void* RuntimeClassHandle_GetTypeFromClass(NrClass* k) { return k ? &k->byval_arg : 0; }
+
+static void register_reflect4(void)
+{
+    k_paraminfo = nr_class_by_name("System.Reflection", "MonoParameterInfo");
+    k_assembly = nr_class_by_name("System.Reflection", "MonoAssembly");
+    k_module = nr_class_by_name("System.Reflection", "MonoModule");
+    static const NrIcall t[] = {
+        { "System.RuntimeType::GetMethodsByName_native", RT_GetMethodsByName_native },
+        { "System.RuntimeType::GetConstructors_native", RT_GetConstructors_native },
+        { "System.RuntimeType::GetFields_native", RT_GetFields_native },
+        { "System.RuntimeType::GetPropertiesByName_native", RT_GetPropertiesByName_native },
+        { "System.RuntimeType::GetEvents_native", RT_GetEvents_native },
+        { "System.RuntimeType::GetNestedTypes_native", RT_GetNestedTypes_native },
+        { "System.RuntimeType::get_Name", MonoType_get_Name },
+        { "System.RuntimeType::get_Namespace", MonoType_get_Namespace },
+        { "System.RuntimeType::getFullName", MonoType_getFullName },
+        { "System.RuntimeType::get_DeclaringType", MonoType_get_DeclaringType },
+        { "System.RuntimeType::get_DeclaringMethod", MonoType_null },
+        { "System.RuntimeType::GetInterfaces", MonoType_GetInterfaces },
+        { "System.RuntimeType::GetGenericArgumentsInternal", RT_GetGenericArgumentsInternal },
+        { "System.RuntimeType::GetGenericParameterPosition", RT_GetGenericParameterPosition },
+        { "System.RuntimeType::make_array_type", Type_make_array_type },
+        { "System.RuntimeType::make_byref_type", Type_make_byref_type },
+        { "System.RuntimeType::MakePointerType", RT_MakePointerType },
+        { "System.RuntimeType::MakeGenericType", Type_MakeGenericType },
+        { "System.RuntimeType::GetPacking", Type_GetPacking },
+        { "System.RuntimeType::GetTypeCodeImplInternal", RT_GetTypeCodeImplInternal },
+        { "System.RuntimeType::CreateInstanceInternal", RT_CreateInstanceInternal },
+        { "System.RuntimeType::GetCorrespondingInflatedMethod", MonoType_GetCorrespondingInflatedMethod },
+        { "System.RuntimeType::GetCorrespondingInflatedConstructor", MonoType_GetCorrespondingInflatedMethod },
+        { "System.RuntimeType::get_core_clr_security_level", RT_security_level },
+        { "System.RuntimeType::IsWindowsRuntimeObjectType", RT_static_false },
+        { "System.RuntimeType::IsTypeExportedToWindowsRuntime", RT_static_false },
+        { "System.RuntimeType::GetInterfaceMapData", RT_GetInterfaceMapData },
+        { "System.RuntimeTypeHandle::GetAttributes", RTH_GetAttributes },
+        { "System.RuntimeTypeHandle::GetBaseType", RTH_GetBaseType },
+        { "System.RuntimeTypeHandle::GetElementType", RTH_GetElementType },
+        { "System.RuntimeTypeHandle::GetArrayRank", RTH_GetArrayRank },
+        { "System.RuntimeTypeHandle::GetMetadataToken", RTH_GetMetadataToken },
+        { "System.RuntimeTypeHandle::HasInstantiation", RTH_HasInstantiation },
+        { "System.RuntimeTypeHandle::IsGenericTypeDefinition", RTH_IsGenericTypeDefinition },
+        { "System.RuntimeTypeHandle::IsGenericVariable", RTH_false },
+        { "System.RuntimeTypeHandle::IsComObject", RTH_false },
+        { "System.RuntimeTypeHandle::GetGenericParameterInfo", RTH_GetGenericParameterInfo },
+        { "System.RuntimeTypeHandle::GetGenericTypeDefinition_impl", RTH_GetGenericTypeDefinition_impl },
+        { "System.RuntimeTypeHandle::IsArray", RTH_IsArray },
+        { "System.RuntimeTypeHandle::IsByRef", RTH_IsByRef },
+        { "System.RuntimeTypeHandle::IsPointer", RTH_IsPointer },
+        { "System.RuntimeTypeHandle::IsPrimitive", RTH_IsPrimitive },
+        { "System.RuntimeTypeHandle::HasReferences", RTH_HasReferences },
+        { "System.RuntimeTypeHandle::IsInstanceOfType", RTH_IsInstanceOfType },
+        { "System.RuntimeTypeHandle::type_is_assignable_from", RTH_type_is_assignable_from },
+        { "System.RuntimeTypeHandle::GetCorElementType", RTH_GetCorElementType },
+        { "System.RuntimeTypeHandle::GetAssembly", RTH_GetAssembly },
+        { "System.RuntimeTypeHandle::GetModule", RTH_GetModule },
+        { "System.Reflection.MethodBase::GetMethodFromHandleInternalType_native", MethodBase_GetMethodFromHandleInternalType_native },
+        { "System.Reflection.PropertyInfo::internal_from_handle_type", PropertyInfo_internal_from_handle_type },
+        { "System.Reflection.EventInfo::internal_from_handle_type", EventInfo_internal_from_handle_type },
+        { "System.Reflection.MonoMethodInfo::get_method_attributes", MonoMethodInfo_get_method_attributes },
+        { "System.Reflection.MonoMethod::get_name", MonoMethod_get_name4 },
+        { "System.Reflection.MonoMethod::GetGenericMethodDefinition_impl", MonoMethod_self },
+        { "System.Reflection.MonoMethod::MakeGenericMethod_impl", MonoMethod_MakeGenericMethod_impl },
+        { "System.Reflection.MonoMethod::GetPInvoke", MonoMethod_GetPInvoke },
+        { "System.Reflection.MonoMethod::get_base_method", MonoMethod_get_base_method },
+        { "System.Reflection.MonoMethod::get_core_clr_security_level", RT_security_level },
+        { "System.Reflection.MonoCMethod::get_core_clr_security_level", RT_security_level },
+        { "System.Reflection.MonoField::get_core_clr_security_level", RT_security_level },
+        { "System.Reflection.MonoField::ResolveType", MonoField_ResolveType },
+        { "System.Reflection.RtFieldInfo::UnsafeGetValue", MonoField_GetValueInternal },
+        { "System.RuntimeFieldHandle::SetValueInternal", MonoField_SetValueInternal },
+        { "System.Reflection.FieldInfo::GetTypeModifiers", FieldInfo_GetTypeModifiers },
+        { "System.Reflection.FieldInfo::get_marshal_info", FieldInfo_get_marshal_info },
+        { "System.Reflection.ParameterInfo::GetMetadataToken", ParameterInfo_GetMetadataToken },
+        { "System.Reflection.ParameterInfo::GetTypeModifiers", ParameterInfo_GetTypeModifiers },
+        { "System.Reflection.Module::get_MetadataToken", Module_get_MetadataToken },
+        { "System.MonoCustomAttrs::GetCustomAttributesDataInternal", MonoCustomAttrs_GetCustomAttributesDataInternal },
+        { "System.Reflection.MonoPropertyInfo::get_property_info", MonoPropertyInfo_get_property_info4 },
+        { "System.Reflection.MonoPropertyInfo::get_default_value", MonoPropertyInfo_get_default_value },
+        { "System.Reflection.AssemblyName::GetNativeName", AssemblyName_GetNativeName },
+        { "System.Reflection.AssemblyName::ParseAssemblyName", AssemblyName_ParseAssemblyName },
+        { "System.Reflection.AssemblyName::get_public_token", AssemblyName_get_public_token },
+        { "Mono.RuntimeMarshal::FreeAssemblyName", RuntimeMarshal_FreeAssemblyName },
+        { "System.Reflection.Assembly::GetManifestModuleInternal", Assembly_GetManifestModuleInternal },
+        { "System.Reflection.Assembly::GetModulesInternal", Assembly_GetModulesInternal },
+        { "System.Reflection.Assembly::GetFilesInternal", Assembly_GetFilesInternal },
+        { "System.Reflection.Assembly::GetAotId", Assembly_GetAotId },
+        { "System.Reflection.Assembly::InternalGetReferencedAssemblies", Assembly_InternalGetReferencedAssemblies },
+        { "System.Reflection.Assembly::GetManifestResourceInfoInternal", Assembly_GetManifestResourceInfoInternal },
+        { "System.Reflection.Assembly::load_with_partial_name", Assembly_load_with_partial_name },
+        { "System.Reflection.Assembly::LoadPermissions", Assembly_LoadPermissions },
+        { "System.Reflection.Assembly::get_global_assembly_cache", Assembly_get_global_assembly_cache },
+        { "System.AppDomain::LoadAssemblyRaw", AppDomain_LoadAssemblyRaw },
+        { "System.MissingMemberException::FormatSignature", MissingMemberException_FormatSignature },
+        { "Mono.RuntimeClassHandle::GetTypeFromClass", RuntimeClassHandle_GetTypeFromClass },
+    };
+    nr_register_icalls(t, (int)(sizeof t / sizeof t[0]));
+}
+#endif
 
 void nr_register_reflect_icalls(void)
 {
@@ -875,4 +1240,7 @@ void nr_register_reflect_icalls(void)
         { "System.Delegate::SetMulticastInvoke", Delegate_SetMulticastInvoke },
     };
     nr_register_icalls(t, (int)(sizeof t / sizeof t[0]));
+#if NR_CORLIB4
+    register_reflect4();
+#endif
 }

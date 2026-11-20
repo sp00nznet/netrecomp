@@ -3,9 +3,11 @@
     py -3 tools/build.py --gen gen --out build/mono.dll            (Unity drop-in)
     py -3 tools/build.py --gen gen --out build/test.exe --exe      (standalone host)
 
-x86 only: Unity 4's player is 32-bit, and generated code assumes 4-byte
-pointers. Uses clang-cl with the MSVC x86 environment from vcvarsall, one
-process per file, and skips objects newer than their source.
+--arch x86 (default) for Unity 4's 32-bit players and their mono.dll; --arch x64
+for Unity 2017+ 64-bit players (mono-2.0-bdwgc.dll). Generated code is
+pointer-size neutral, so one gen tree builds for either. Uses clang-cl with the
+MSVC environment from vcvarsall, one process per file, and skips objects newer
+than their source.
 """
 import argparse, concurrent.futures, os, subprocess, sys, glob, json
 
@@ -17,12 +19,12 @@ GC_DEFS = ["/DGC_THREADS", "/DGC_NOT_DLL", "/DPARALLEL_MARK", "/DTHREAD_LOCAL_AL
            "/DGC_DISABLE_INCREMENTAL", "/D_CRT_SECURE_NO_WARNINGS", "/DDONT_USE_USER32_DLL", "/DGC_BUILTIN_ATOMIC"]
 
 
-def msvc_env():
-    """The x86 developer environment, captured once from vcvarsall."""
+def msvc_env(arch="x86"):
+    """The developer environment for arch, captured once from vcvarsall."""
     vs = subprocess.run([r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe", "-latest",
                          "-property", "installationPath"], capture_output=True, text=True).stdout.strip()
     bat = os.path.join(vs, r"VC\Auxiliary\Build\vcvarsall.bat")
-    out = subprocess.run(f'cmd /s /c ""{bat}" x86 >nul && set"', capture_output=True, text=True, shell=True).stdout
+    out = subprocess.run(f'cmd /s /c ""{bat}" {"x64" if arch == "x64" else "x86"} >nul && set"', capture_output=True, text=True, shell=True).stdout
     env = dict(os.environ)
     for line in out.splitlines():
         k, _, v = line.partition("=")
@@ -45,13 +47,14 @@ def main():
     ap.add_argument("--opt", default="-O2", help="dash form: Git Bash rewrites /O2 into a path")
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("--compile-only", action="store_true")
+    ap.add_argument("--arch", choices=["x86", "x64"], default="x86")
     a = ap.parse_args()
 
     if not os.path.isdir(GC_DIR):
         sys.path.insert(0, HERE)
         import fetch_deps
         fetch_deps.fetch()
-    env = msvc_env()
+    env = msvc_env(a.arch)
     cc = find_clang()
     objdir = os.path.join(os.path.dirname(os.path.abspath(a.out)), "obj")
     os.makedirs(objdir, exist_ok=True)
@@ -61,9 +64,9 @@ def main():
     host = os.path.join(RUNTIME, "host_exe.c" if a.exe else "host_mono.c")
     if os.path.exists(host):
         srcs.append(host)
-    hdrs = [os.path.join(a.gen, "nrgen.h"), os.path.join(RUNTIME, "nr.h"), os.path.join(RUNTIME, "nrrt.h")]
+    hdrs = [os.path.join(a.gen, "nrgen.h"), os.path.join(a.gen, "nrcfg.h"), os.path.join(RUNTIME, "nr.h"), os.path.join(RUNTIME, "nrrt.h")]
     hdr_time = max(os.path.getmtime(h) for h in hdrs if os.path.exists(h))
-    flags = ["-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks", "/EHa", "/W0", "-Wno-everything",
+    flags = ["-m64" if a.arch == "x64" else "-m32", "/c", a.opt, "/Oy-", "/Zi", "/MT", "/GS-", "-fms-extensions", "/clang:-fno-delete-null-pointer-checks", "/EHa", "/W0", "-Wno-everything",
              "-ferror-limit=50", "/I", RUNTIME, "/I", a.gen, "/I", os.path.join(GC_DIR, "include"), "/DNR_BUILD"] + GC_DEFS
 
     def one(src):
@@ -97,7 +100,7 @@ def main():
     rsp = os.path.join(objdir, "link.rsp")
     with open(rsp, "w") as f:
         f.write("\n".join(f'"{o}"' for o in objs))
-    args = link + ["/nologo", "/machine:x86", "/debug", "/out:" + a.out, "@" + rsp,
+    args = link + ["/nologo", "/machine:" + a.arch, "/debug", "/out:" + a.out, "@" + rsp,
                    "kernel32.lib", "user32.lib", "ole32.lib", "oleaut32.lib", "advapi32.lib", "shell32.lib", "ws2_32.lib"]
     if not a.exe:
         args += ["/dll"]

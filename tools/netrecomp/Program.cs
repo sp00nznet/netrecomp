@@ -9,7 +9,8 @@ static class Program
         if (args.Length >= 2 && args[0] == "stats") return Stats(args[1]);
         if (args.Length >= 3 && args[0] == "dump") return Dump(args[1], args.Skip(2).ToArray());
         if (args.Length >= 2 && args[0] == "lift") return Lift(args.Skip(1).ToArray());
-        Console.Error.WriteLine("usage: netrecomp lift <Managed dir> -o <gen dir> [--exe <assembly>] [--report <file>]\n" +
+        if (args.Length == 3 && args[0] == "publicize") return Mods.Publicize(args[1], args[2]);
+        Console.Error.WriteLine("usage: netrecomp lift <Managed dir> -o <gen dir> [--exe <assembly>] [--mod <assembly>]... [--report <file>]\n" +
                                 "       netrecomp stats <Managed dir>\n       netrecomp dump <dll> <Type>...");
         return 2;
     }
@@ -46,18 +47,23 @@ static class Program
         "System.Security.Cryptography.RNGCryptoServiceProvider",   // CryptoConfig creates it by name (Guid.NewGuid)
         "System.Single", "System.Double", "System.IntPtr", "System.Int16", "System.UInt16", "System.UInt32",
         "System.UInt64", "System.SByte", "System.UIntPtr", "System.Void", "System.DBNull", "System.Reflection.Missing",
+        // mono's 4.x profile (Unity 2017+); names a profile lacks are skipped
+        "System.RuntimeType", "System.Threading.InternalThread", "System.Reflection.MonoAssembly",
+        "System.Reflection.MonoModule", "System.Reflection.MonoParameterInfo", "System.Reflection.RuntimeAssembly",
     };
 
     static int Lift(string[] args)
     {
         string dir = args[0], outDir = "gen";
         string? exe = null, report = null;
+        var mods = new List<string>();
         for (int i = 1; i < args.Length; i++)
             switch (args[i])
             {
                 case "-o": outDir = args[++i]; break;
                 case "--exe": exe = args[++i]; break;
                 case "--report": report = args[++i]; break;
+                case "--mod": mods.Add(args[++i]); break;
                 default: Console.Error.WriteLine("unknown option " + args[i]); return 2;
             }
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -68,11 +74,20 @@ static class Program
             w.Asms[a.Name.Name] = a;
             w.Resolver.Add(a);
         }
+        Mods.Compat(w);
+        foreach (var mp in mods)
+        {
+            var a = AssemblyDefinition.ReadAssembly(mp, new ReaderParameters { AssemblyResolver = w.Resolver });
+            w.Asms[a.Name.Name] = a;
+            w.Resolver.Add(a);
+            Console.WriteLine($"mod {a.Name.Name}: {Mods.Apply(w, a)} hooks");
+        }
         var g = new Gen(w);
         var none = Array.Empty<TT>();
         foreach (var n in RuntimeTypes)
         {
             var dot = n.LastIndexOf('.');
+            if (w.Corlib.MainModule.GetType(n[..dot], n[(dot + 1)..]) is not { IsAbstract: false }) continue;
             var t = w.Cor(n[..dot], n[(dot + 1)..]);
             g.Construct(t);
             foreach (var c in t.Def.Methods.Where(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count <= 1 && !m.HasGenericParameters))
@@ -80,6 +95,14 @@ static class Program
         }
         foreach (var et in new[] { "Object", "Byte", "Char", "String", "Int32", "Single" })
             g.Construct(w.SzArray(w.Cor("System", et)));
+        // arrays the runtime's reflection hands out, with their generic interfaces
+        foreach (var n in new[] { "System.Type", "System.Reflection.Assembly", "System.Reflection.MemberInfo", "System.Reflection.MethodInfo",
+                                  "System.Reflection.FieldInfo", "System.Reflection.PropertyInfo", "System.Reflection.ConstructorInfo",
+                                  "System.Reflection.ParameterInfo", "System.Reflection.EventInfo" })
+        {
+            var dot = n.LastIndexOf('.');
+            if (w.Corlib.MainModule.GetType(n[..dot], n[(dot + 1)..]) != null) g.Construct(w.SzArray(w.Cor(n[..dot], n[(dot + 1)..])));
+        }
 
         if (exe != null)
         {

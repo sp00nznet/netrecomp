@@ -104,25 +104,46 @@ sealed class Gen
     // a typeof(X<>) literal), which no IL scan can see.
     void AotHints(MI m)
     {
-        if (!m.Def.IsConstructor || !m.Def.IsStatic || m.Owner.Args.Length != 1) return;
+        // new T() is Activator.CreateInstance<T>(), which reaches T's default ctor by reflection
+        if (m.Def.Name == "CreateInstance" && m.MArgs.Length == 1 && m.Owner.Def.FullName == "System.Activator")
+        {
+            var t0 = m.MArgs[0];
+            if (t0.K == TK.Def && !t0.IsInterface && !t0.Def.IsAbstract && !t0.IsOpen)
+            {
+                Construct(t0);
+                foreach (var c in t0.Def.Methods.Where(x => x.IsConstructor && !x.IsStatic && x.Parameters.Count == 0)) Need(W.Method(t0, c, Array.Empty<TT>()));
+            }
+            return;
+        }
+        // 2.x builds the default comparer in the cctor, 4.x in CreateComparer
+        if (!(m.Def.IsConstructor && m.Def.IsStatic) && m.Def.Name != "CreateComparer") return;
+        if (m.Owner.Args.Length != 1) return;
         var o = m.Owner.Def;
         if (o.Module.Assembly.Name.Name != "mscorlib" || o.Namespace != "System.Collections.Generic") return;
         var t = m.Owner.Args[0];
-        (string iface, string impl) = o.Name switch
+        bool eq = o.Name == "EqualityComparer`1";
+        if (!eq && o.Name != "Comparer`1") return;
+        var iface = eq ? "IEquatable`1" : "IComparable`1";
+        bool Has(TT x) { var it = W.Inst(W.CorDef("System", iface), new[] { x }); Klass(it); return x.K == TK.Def && !x.IsInterface && Lay.Full(x).IfaceSlots.ContainsKey(it); }
+        void Make(string impl, TT arg)
         {
-            "EqualityComparer`1" => ("IEquatable`1", "GenericEqualityComparer`1"),
-            "Comparer`1" => ("IComparable`1", "GenericComparer`1"),
-            _ => ("", ""),
-        };
-        if (impl == "") return;
-        var it = W.Inst(W.CorDef("System", iface), new[] { t });
-        if (t.K == TK.Def && !t.IsInterface && Lay.Full(t).IfaceSlots.ContainsKey(it))
-        {
-            var ct = W.Inst(W.CorDef("System.Collections.Generic", impl), new[] { t });
+            var d = W.Corlib.MainModule.GetType("System.Collections.Generic", impl);
+            if (d == null) return;
+            var ct = W.Inst(d, new[] { arg });
             Construct(ct);
             foreach (var c in ct.Def.Methods.Where(x => x.IsConstructor && !x.IsStatic)) Need(W.Method(ct, c, Array.Empty<TT>()));
         }
+        if (Has(t)) Make(eq ? "GenericEqualityComparer`1" : "GenericComparer`1", t);
+        if (g4 && t.K == TK.Def && t.IsGenericInst && t.Def.FullName == "System.Nullable`1" && Has(t.Args[0]))
+            Make(eq ? "NullableEqualityComparer`1" : "NullableComparer`1", t.Args[0]);
+        if (g4 && eq && t.K == TK.Def && t.IsEnum)
+        {
+            var u = Lay.EnumBase(t).Def.FullName;
+            Make(u is "System.Int16" ? "ShortEnumEqualityComparer`1" : u is "System.SByte" ? "SByteEnumEqualityComparer`1"
+                : u is "System.Int64" or "System.UInt64" ? "LongEnumEqualityComparer`1" : "EnumEqualityComparer`1", t);
+        }
     }
+    bool g4 => Corlib4;
 
     public void Construct(TT t)
     {
@@ -185,6 +206,9 @@ sealed class Gen
     }
     public string Rva(FI f) { FieldHandle(f); return $"RVA{fhandles[f.Def].id}"; }
 
+    // mono's 4.x class library (Unity 2017+): MulticastDelegate.delegates, RuntimeType, ...
+    bool? corlib4;
+    public bool Corlib4 => corlib4 ??= W.CorDef("System", "MulticastDelegate").Fields.Any(f => f.Name == "delegates");
     public bool IsDelegate(TT t) => t.K == TK.Def && t.Def.BaseType?.FullName == "System.MulticastDelegate";
     public bool IsNullable(TT t) => t.K == TK.Def && t.Def.FullName == "System.Nullable`1";
     public string NullableHasValueOffset(TT t) { ObjStructValue(t); return $"offsetof({Lay.C(t)}, {Lay.Full(t).FieldName[t.Def.Fields.First(f => f.Name is "has_value" or "hasValue")]})"; }
@@ -386,6 +410,19 @@ sealed class Gen
                 }
             }
             else if (t.K == TK.SzArray && Blittable(t.Elem)) { nparams.Add("void*"); nargs.Add($"({a} ? NR_ADATA({a}) : 0)"); }
+            else if (t.K == TK.Def && t.Def.FullName == "System.Char") { nparams.Add("uint16_t"); nargs.Add(a); }
+            else if (IsSafeHandle(t))
+            {
+                // a SafeHandle passes its handle (Steamworks.NET's UTF8StringHandle, file handles)
+                var sh = W.Cor("System.Runtime.InteropServices", "SafeHandle");
+                nparams.Add("void*");
+                nargs.Add($"({a} ? (void*)(({ObjStruct(sh)}*){a})->{FieldC(W.Field(sh.Def.Fields.First(f => f.Name == "handle"), sh.Args, Array.Empty<TT>()))} : 0)");
+            }
+            else if (t.K == TK.Def && t.Def.FullName == "System.Runtime.InteropServices.HandleRef")
+            {
+                nparams.Add("void*");
+                nargs.Add($"(void*){a}.{FieldC(W.Field(t.Def.Fields.First(f => f.Name is "handle" or "_handle"), t.Args, Array.Empty<TT>()))}");
+            }
             else if (t.K == TK.ByRef && Blittable(t.Elem)) { nparams.Add("void*"); nargs.Add(a); }
             else if (Blittable(t)) { nparams.Add(Lay.C(t)); nargs.Add(a); }
             else if (IsDelegate(t)) { RevPool(t); nparams.Add("void*"); nargs.Add($"nr_delegate_to_fnptr({a})"); }
@@ -414,6 +451,13 @@ sealed class Gen
         var alt = pi.IsNoMangle ? "0" : $"\"{CEsc(entry + (unicode ? "W" : "A"))}\"";
         sb.Append($"    if (!fn) fn = nr_pinvoke(\"{CEsc(lib)}\", \"{CEsc(entry)}\", {alt});\n");
         sb.Append(pre);
+        // x64 has one calling convention, so the call is direct and typed.
+        var castargs = nargs.Select((x, i) => System.Text.RegularExpressions.Regex.IsMatch(nparams[i], @"^T[0-9]+$") ? x : $"({nparams[i]}){x}");
+        var dcall = $"(({nrt} (*)({string.Join(", ", nparams.DefaultIfEmpty("void"))}))fn)({string.Join(", ", castargs)})";
+        sb.Append("#ifdef _WIN64\n");
+        if (nrt == "void") sb.Append($"    {dcall};\n").Append(post);
+        else sb.Append($"    {{ {nrt} r = {dcall};\n").Append(post).Append($"    return {conv}; }}\n");
+        sb.Append("#else\n");
         sb.Append($"    uint32_t pv[{Math.Max(1, nparams.Count * 4 + 4)}]; int32_t pn = 0;\n");
         for (int i = 0; i < nparams.Count; i++)
         {
@@ -434,8 +478,15 @@ sealed class Gen
             else sb.Append($"    {nrt} r = ({nrt})nr_native_call(fn, pv, pn);\n");
             sb.Append(post).Append($"    return {conv};\n");
         }
-        sb.Append("}\n");
+        sb.Append("#endif\n}\n");
         return sb.ToString();
+    }
+
+    bool IsSafeHandle(TT t)
+    {
+        for (var c = t; c != null && c.K == TK.Def; c = W.BaseOf(c))
+            if (c.Def.FullName == "System.Runtime.InteropServices.SafeHandle") return true;
+        return false;
     }
 
     bool Blittable(TT t)
@@ -462,7 +513,16 @@ sealed class Gen
         var ret = rt == "void" ? "" : "return ";
         var sb = new StringBuilder();
         sb.Append(Proto(m)).Append("\n{\n    NrDelegate* d = (NrDelegate*)a0;\n");
-        sb.Append($"    if (d->prev) {Name(m)}({string.Join(", ", args.Prepend("d->prev"))});\n");
+        if (Corlib4)
+        {
+            // 4.x profile: a combined delegate holds its parts in `delegates`
+            var md = W.Cor("System", "MulticastDelegate");
+            var dl = $"(({ObjStruct(md)}*)a0)->{FieldC(W.Field(md.Def.Fields.First(f => f.Name == "delegates"), md.Args, Array.Empty<TT>()))}";
+            sb.Append($"    if ({dl}) {{ NrArray* da = (NrArray*){dl}; void** dv = (void**)NR_ADATA(da); uint32_t di;\n");
+            sb.Append($"        for (di = 0; di + 1 < da->max_length; di++) {Name(m)}({string.Join(", ", args.Prepend("dv[di]"))});\n");
+            sb.Append($"        {ret}{Name(m)}({string.Join(", ", args.Prepend("dv[di]"))}); {(ret == "" ? "return; " : "")}}}\n");
+        }
+        else sb.Append($"    if (d->prev) {Name(m)}({string.Join(", ", args.Prepend("d->prev"))});\n");
         sb.Append($"    if (d->target) {ret}(({rt} (*)({string.Join(", ", ps.Prepend("void*"))}))d->method_ptr)({string.Join(", ", args.Prepend("d->target"))});\n");
         sb.Append($"    else {ret}(({rt} (*)({string.Join(", ", ps.DefaultIfEmpty("void"))}))d->method_ptr)({string.Join(", ", args)});\n");
         sb.Append("}\n");
@@ -495,18 +555,19 @@ sealed class Gen
     public void Write(string dir, int perFile = 1500)
     {
         Directory.CreateDirectory(dir);
-        foreach (var f in Directory.GetFiles(dir, "m_*.c")) File.Delete(f);
+        var stale = new HashSet<string>(Directory.GetFiles(dir, "m_*.c"));
         // Close the class set over parents, elements, interfaces and vtables.
         var meta = new MetaWriter(this);
         meta.Close();
-        File.WriteAllText(Path.Combine(dir, "nrgen.h"), meta.Header());
+        Put(Path.Combine(dir, "nrgen.h"), meta.Header());
+        Put(Path.Combine(dir, "nrcfg.h"), $"/* generated: the class library the code was compiled against */\n#define NR_CORLIB4 {(Corlib4 ? 1 : 0)}\n");
         int file = 0;
         for (int i = 0; i < order.Count; i += perFile)
         {
             var sb = new StringBuilder("#include \"nrgen.h\"\n\n");
             foreach (var m in order.Skip(i).Take(perFile))
                 if (bodies[m].Length > 0) sb.Append("// ").Append(m.Key.Replace("\n", " ").Replace("*/", "* /")).Append('\n').Append(bodies[m]).Append('\n');
-            File.WriteAllText(Path.Combine(dir, $"m_{file++:d3}.c"), sb.ToString());
+            { var fp = Path.Combine(dir, $"m_{file++:d3}.c"); stale.Remove(fp); Put(fp, sb.ToString()); }
         }
         var mc = meta.Body();
         if (Entry != null)
@@ -516,10 +577,18 @@ sealed class Gen
             mc += $"\nint32_t nr_entry(void* a) {{ (void)a; {(Layouts.IsVoid(W.RetType(Entry)) ? call + "; return 0;" : "return " + call + ";")} }}\n";
         }
         else mc += "\nint32_t nr_entry(void* a) { (void)a; return -1; }\n";
-        File.WriteAllText(Path.Combine(dir, "meta.c"), mc);
+        Put(Path.Combine(dir, "meta.c"), mc);
         File.WriteAllLines(Path.Combine(dir, "icalls.txt"), IcallKeys);
-        File.WriteAllText(Path.Combine(dir, "chartab.c"), CharTables());
-        File.WriteAllText(Path.Combine(dir, "fmttab.c"), FormatterTables());
+        Put(Path.Combine(dir, "chartab.c"), CharTables());
+        Put(Path.Combine(dir, "fmttab.c"), FormatterTables());
+        foreach (var f in stale) File.Delete(f);
+    }
+
+    // Unchanged files keep their timestamps, so build.py recompiles only what moved.
+    static void Put(string path, string text)
+    {
+        if (File.Exists(path) && File.ReadAllText(path) == text) return;
+        File.WriteAllText(path, text);
     }
 
     // System.Char's lookup tables (mono's runtime supplied these), built from
@@ -622,7 +691,7 @@ sealed class Gen
             if (pt.K == TK.Def && pt.Def.FullName == "System.String") { nps.Add("const char*"); conv.Add($"nr_str_from_utf8(a{i})"); }
             else if (pt.K == TK.Def && pt.Def.FullName == "System.Boolean") { nps.Add("int32_t"); conv.Add($"(uint8_t)(a{i} != 0)"); }
             else if (pt.K == TK.ByRef || Blittable(pt)) { nps.Add(pt.K == TK.ByRef ? "void*" : Lay.C(pt)); conv.Add($"a{i}"); }
-            else throw new EmitError("reverse P/Invoke parameter " + pt.Key);
+            else { nps.Add("void*"); conv.Add("0"); Console.Error.WriteLine($"warning: reverse P/Invoke {d.Key}: parameter {i} ({pt.Key}) arrives as null"); } // ponytail: unmarshalled callback args are null; marshal them if a title reads one
         }
         var rt = W.RetType(inv);
         string nrt = Layouts.IsVoid(rt) ? "void" : rt.K == TK.Def && rt.Def.FullName == "System.Boolean" ? "int32_t" : Lay.C(rt);

@@ -33,11 +33,11 @@ static void* Object_MemberwiseClone(void* self)
 {
     NrClass* k = OBJ(self)->klass;
     size_t size;
-    if (k == nr_k_string) size = 12 + 2 * ((size_t)STR(self)->length + 1);
+    if (k == nr_k_string) size = offsetof(NrString, chars) + 2 * ((size_t)STR(self)->length + 1);
     else if (k->flags & NR_ARRAY)
     {
         NrArray* a = ARR(self);
-        size = 16 + (size_t)k->elem_size * a->max_length;
+        size = offsetof(NrArray, vector) + (size_t)k->elem_size * a->max_length;
         if (a->bounds) size = ((size + 7) & ~7u) + sizeof(NrBounds) * k->rank;
     }
     else size = (size_t)k->instance_size;
@@ -320,7 +320,7 @@ static void RuntimeHelpers_InitializeArray(void* arr, intptr_t field)
     if (!f || !f->rva || f->rva_size < n) nr_throw_new("System", "ArgumentException", "Field does not hold initial data for this array.");
     memcpy(ARR(arr)->vector, f->rva, (size_t)n);
 }
-static int32_t RuntimeHelpers_get_OffsetToStringData(void) { return 12; }
+static int32_t RuntimeHelpers_get_OffsetToStringData(void) { return (int32_t)offsetof(NrString, chars); }
 static void* RuntimeHelpers_GetObjectValue(void* o)
 {
     if (o && (OBJ(o)->klass->flags & NR_VALUETYPE)) return Object_MemberwiseClone(o);
@@ -602,6 +602,7 @@ typedef struct NrThreadInfo { void* thread_obj; uint32_t handle; } NrThreadInfo;
 static __declspec(thread) NrThreadInfo* tinfo;
 static int32_t off_thread_state = -1, off_thread_id, off_start_obj, off_threadstart, off_cached_culture, off_cached_ui, off_name, off_handle;
 
+#if !NR_CORLIB4
 static void thread_offsets(void)
 {
     if (off_thread_state >= 0) return;
@@ -613,14 +614,55 @@ static void thread_offsets(void)
     off_handle = foff(nr_k_thread, "system_thread_handle");
     off_thread_state = foff(nr_k_thread, "state");
 }
+#endif
+
+#if NR_CORLIB4
+/* mono 4.x: Thread keeps its state in an InternalThread (thread_id, state,
+ * name, handle, managed_id); the offsets below are InternalThread's. */
+static NrClass* k_ithread;
+static int32_t off_internal, off_m_delegate, off_m_arg, off_managed_id;
+static volatile LONG next_managed_id;
+static void thread_offsets(void)
+{
+    if (off_thread_state >= 0) return;
+    k_ithread = nr_class_by_name("System.Threading", "InternalThread");
+    off_internal = foff(nr_k_thread, "internal_thread");
+    off_m_delegate = foff(nr_k_thread, "m_Delegate");
+    off_m_arg = foff(nr_k_thread, "m_ThreadStartArg");
+    off_thread_id = foff(k_ithread, "thread_id");
+    off_name = foff(k_ithread, "name");
+    off_handle = foff(k_ithread, "handle");
+    off_managed_id = foff(k_ithread, "managed_id");
+    off_thread_state = foff(k_ithread, "state");
+}
+static void* internal_of(void* t)
+{
+    thread_offsets();
+    void* it = FIELD(t, void*, off_internal);
+    if (!it)
+    {
+        it = nr_new(k_ithread);
+        FIELD(it, int32_t, off_managed_id) = (int32_t)InterlockedIncrement(&next_managed_id);
+        FIELD(it, int32_t, off_thread_state) = 8;   /* Unstarted */
+        FIELD(t, void*, off_internal) = it;
+    }
+    return it;
+}
+#endif
 
 static void* thread_object_for_current(void* existing)
 {
     thread_offsets();
     void* t = existing;
     if (!t) t = nr_new(nr_k_thread);
+#if NR_CORLIB4
+    void* it = internal_of(t);
+    FIELD(it, int32_t, off_thread_state) = 0;   /* Running */
+    FIELD(it, int64_t, off_thread_id) = (int64_t)GetCurrentThreadId();
+#else
     FIELD(t, int32_t, off_thread_state) = 0;   /* Running */
     FIELD(t, int64_t, off_thread_id) = (int64_t)GetCurrentThreadId();
+#endif
     NrThreadInfo* ti = (NrThreadInfo*)calloc(1, sizeof *ti);
     ti->thread_obj = t;
     ti->handle = nr_gchandle_new(t, 0);
@@ -661,7 +703,7 @@ static void Thread_ClrState(void* self, int32_t s) { thread_offsets(); FIELD(sel
 static void Thread_ResetAbort_internal(void) {}
 static void Thread_FreeLocalSlotValues(int32_t slot, uint8_t tl) { (void)slot; (void)tl; }
 
-typedef struct StartArgs { void* thread; uint32_t h; HANDLE ready; } StartArgs;
+typedef struct StartArgs { void* thread; uint32_t h; HANDLE ready; uint32_t dh, ah; } StartArgs;
 
 static DWORD WINAPI thread_main(LPVOID p)
 {
@@ -672,8 +714,15 @@ static DWORD WINAPI thread_main(LPVOID p)
     nr_gchandle_free(a->h);
     SetEvent(a->ready);
     thread_object_for_current(t);
+#if NR_CORLIB4
+    /* the delegate and argument were captured at start: Start clears m_ThreadStartArg */
+    void* d = nr_gchandle_target(a->dh);
+    void* arg = a->ah ? nr_gchandle_target(a->ah) : 0;
+    nr_gchandle_free(a->dh); if (a->ah) nr_gchandle_free(a->ah);
+#else
     void* d = FIELD(t, void*, off_threadstart);
     void* arg = FIELD(t, void*, off_start_obj);
+#endif
     const NrMethodDesc* inv = nr_method(OBJ(d)->klass, "Invoke", -1);
     void* ex = 0;
     void* args[1] = { arg };
@@ -687,7 +736,11 @@ static DWORD WINAPI thread_main(LPVOID p)
             if (nr_unhandled_hook) nr_unhandled_hook(ex);
         }
     }
+#if NR_CORLIB4
+    FIELD(internal_of(t), int32_t, off_thread_state) = 16;  /* Stopped */
+#else
     FIELD(t, int32_t, off_thread_state) = 16;  /* Stopped */
+#endif
     nr_gchandle_free(tinfo->handle);
     free(tinfo); tinfo = 0;
     return 0;
@@ -697,12 +750,22 @@ static intptr_t Thread_Thread_internal(void* self, void* start)
 {
     thread_offsets();
     (void)start;
-    StartArgs a = { self, nr_gchandle_new(self, 0), CreateEventA(0, TRUE, FALSE, 0) };
+    StartArgs a = { self, nr_gchandle_new(self, 0), CreateEventA(0, TRUE, FALSE, 0), 0, 0 };
+#if NR_CORLIB4
+    a.dh = nr_gchandle_new(start ? start : FIELD(self, void*, off_m_delegate), 0);
+    void* sarg = FIELD(self, void*, off_m_arg);
+    a.ah = sarg ? nr_gchandle_new(sarg, 0) : 0;
+    void* it = internal_of(self);
+#endif
     HANDLE h = CreateThread(0, 0, thread_main, &a, 0, 0);
     if (!h) { CloseHandle(a.ready); return 0; }
     WaitForSingleObject(a.ready, INFINITE);
     CloseHandle(a.ready);
+#if NR_CORLIB4
+    FIELD(it, intptr_t, off_handle) = (intptr_t)h;
+#else
     FIELD(self, intptr_t, off_handle) = (intptr_t)h;
+#endif
     return (intptr_t)h;
 }
 
@@ -722,6 +785,8 @@ static double VR_r8(double* p) { MemoryBarrier(); return *(volatile double*)p; }
 static float VR_r4(float* p) { MemoryBarrier(); return *(volatile float*)p; }
 static int32_t VR_u1(uint8_t* p) { MemoryBarrier(); return *(volatile uint8_t*)p; }
 static int32_t VR_i2(int16_t* p) { MemoryBarrier(); return *(volatile int16_t*)p; }
+static intptr_t VR_ip(intptr_t* p) { MemoryBarrier(); return *(volatile intptr_t*)p; }
+static void VW_ip(intptr_t* p, intptr_t v) { *(volatile intptr_t*)p = v; MemoryBarrier(); }
 static void* VR_ref(void** p) { MemoryBarrier(); return *(void* volatile*)p; }
 static void VW_i4(int32_t* p, int32_t v) { *(volatile int32_t*)p = v; MemoryBarrier(); }
 static void VW_i8(int64_t* p, int64_t v) { InterlockedExchange64((volatile LONG64*)p, v); }
@@ -1224,6 +1289,9 @@ static int32_t AppDomain_getDomainID(void* self) { (void)self; return 1; }
 
 extern void nr_register_reflect_icalls(void);
 void nr_register_corlib_icalls2(void);
+#if NR_CORLIB4
+static void nr_register_corlib4_icalls(void);
+#endif
 
 static const NrIcall corlib[] = {
     { "System.Object::GetType", Object_GetType },
@@ -1378,8 +1446,8 @@ static const NrIcall corlib[] = {
     { "System.Threading.Thread::VolatileRead(sbyte&)", VR_u1 },
     { "System.Threading.Thread::VolatileRead(int16&)", VR_i2 },
     { "System.Threading.Thread::VolatileRead(uint16&)", VR_i2 },
-    { "System.Threading.Thread::VolatileRead(intptr&)", VR_i4 },
-    { "System.Threading.Thread::VolatileRead(uintptr&)", VR_i4 },
+    { "System.Threading.Thread::VolatileRead(intptr&)", VR_ip },
+    { "System.Threading.Thread::VolatileRead(uintptr&)", VR_ip },
     { "System.Threading.Thread::VolatileRead(object&)", VR_ref },
     { "System.Threading.Thread::VolatileWrite(int&,int)", VW_i4 },
     { "System.Threading.Thread::VolatileWrite(uint&,uint)", VW_i4 },
@@ -1391,8 +1459,8 @@ static const NrIcall corlib[] = {
     { "System.Threading.Thread::VolatileWrite(sbyte&,sbyte)", VW_u1 },
     { "System.Threading.Thread::VolatileWrite(int16&,int16)", VW_i2 },
     { "System.Threading.Thread::VolatileWrite(uint16&,uint16)", VW_i2 },
-    { "System.Threading.Thread::VolatileWrite(intptr&,intptr)", VW_i4 },
-    { "System.Threading.Thread::VolatileWrite(uintptr&,uintptr)", VW_i4 },
+    { "System.Threading.Thread::VolatileWrite(intptr&,intptr)", VW_ip },
+    { "System.Threading.Thread::VolatileWrite(uintptr&,uintptr)", VW_ip },
     { "System.Threading.Thread::VolatileWrite(object&,object)", VW_ref },
     { "System.Threading.Interlocked::CompareExchange(int&,int,int)", IL_CmpXchg_i4 },
     { "System.Threading.Interlocked::CompareExchange(object&,object,object)", IL_CmpXchg_ref },
@@ -1509,6 +1577,9 @@ void nr_register_corlib_icalls(void)
     nr_register_icalls(corlib, (int)(sizeof corlib / sizeof corlib[0]));
     nr_register_reflect_icalls();
     nr_register_corlib_icalls2();
+#if NR_CORLIB4
+    nr_register_corlib4_icalls();
+#endif
 }
 
 /* NumberFormatter.GetFormatterTables: the tables come from the generated fmttab.c */
@@ -1529,3 +1600,588 @@ void nr_register_corlib_icalls2(void)
     };
     nr_register_icalls(t, (int)(sizeof t / sizeof t[0]));
 }
+
+/* ==== mono 4.x class library (Unity 2017+, "MonoBleedingEdge") ====
+ * The 4.x profile renamed or reshaped many internal calls: these are the
+ * ones whose names or signatures differ from 2.x. Registered after the 2.x
+ * table, so a key both define takes this version. Reflection's share is in
+ * nr_reflect.c. */
+#if NR_CORLIB4
+#include <oleauto.h>
+#pragma comment(lib, "oleaut32.lib")
+
+static void* String_FastAllocateString(int32_t len) { return nr_str_alloc(len); }
+
+static void Monitor_try_enter_with_atomic_var(void* o, int32_t ms, uint8_t* taken)
+{
+    if (Monitor_try_enter(o, ms)) *taken = 1;
+}
+
+/* Interlocked.CompareExchange(ref int, int, int, ref bool succeeded) */
+static int32_t IL_CmpXchg_i4b(int32_t* p, int32_t v, int32_t c, uint8_t* ok)
+{
+    int32_t r = InterlockedCompareExchange((volatile LONG*)p, v, c);
+    *ok = r == c;
+    return r;
+}
+
+/* Volatile.Read/Write: bool, int and reference-typed T (the generic ones get T's class last) */
+static int32_t Vol_Read_u1(uint8_t* p) { MemoryBarrier(); return *(volatile uint8_t*)p; }
+static void* Vol_Read_T(void** p, NrClass* t) { (void)t; MemoryBarrier(); return *(void* volatile*)p; }
+static void Vol_Write_T(void** p, void* v, NrClass* t) { (void)t; *(void* volatile*)p = v; MemoryBarrier(); }
+
+/* ---- threads ---- */
+static void Thread_ConstructInternalThread(void* self) { internal_of(self); }
+static void* Thread_GetCurrentThread(void) { return nr_current_thread_object(); }
+static void Thread_SleepInternal(int32_t ms) { Sleep(ms < 0 ? INFINITE : (DWORD)ms); }
+static uint8_t Thread_YieldInternal(void) { return SwitchToThread() != 0; }
+static int32_t Thread_SystemMaxStackStize(void) { return 1 << 24; }
+static uint8_t Thread_JoinInternal(void* self, int32_t ms)
+{
+    intptr_t h = FIELD(internal_of(self), intptr_t, off_handle);
+    if (!h) return 1;
+    return WaitForSingleObject((HANDLE)h, ms < 0 ? INFINITE : (DWORD)ms) == WAIT_OBJECT_0;
+}
+static void Thread_SetPriorityNative(void* self, int32_t p) { (void)self; (void)p; }
+static int32_t Thread_GetPriorityNative(void* self) { (void)self; return 2; }
+static void* Thread_GetAbortExceptionState(void* self) { (void)self; return 0; }
+static void* Thread_ByteArrayToDomain(void* a) { return a; }
+static void Thread_InterruptInternal(void* self) { (void)self; }
+
+/* ---- thread pool: mono 4.x runs the managed work queue on native workers ----
+ * RequestWorkerThread asks for a worker; each one calls
+ * _ThreadPoolWaitCallback.PerformWaitCallback until it says the queue is dry.
+ * ponytail: up to one worker per core, no hill-climbing; mono adds threads
+ * when work starves, add that if a title queues blocking work items. */
+static volatile LONG tp_idle, tp_threads, tp_pending;
+static HANDLE tp_sem;
+static const NrMethodDesc* tp_perform;
+static DWORD WINAPI tp_worker(LPVOID p)
+{
+    (void)p;
+    nr_thread_attach();
+    for (;;)
+    {
+        InterlockedIncrement(&tp_idle);
+        DWORD r = WaitForSingleObject(tp_sem, 20000);
+        InterlockedDecrement(&tp_idle);
+        if (r != WAIT_OBJECT_0) continue;
+        InterlockedDecrement(&tp_pending);
+        void* ex = 0;
+        nr_invoke(tp_perform, 0, 0, &ex);
+        if (ex && nr_unhandled_hook) nr_unhandled_hook(ex);
+    }
+    return 0;
+}
+static uint8_t ThreadPool_RequestWorkerThread(void)
+{
+    if (!tp_perform)
+    {
+        NrClass* k = nr_class_by_name("System.Threading", "_ThreadPoolWaitCallback");
+        tp_perform = k ? nr_method(k, "PerformWaitCallback", 0) : 0;
+        if (!tp_perform || !tp_perform->fn) { nr_log("netrecomp: _ThreadPoolWaitCallback.PerformWaitCallback not compiled\n"); return 0; }
+        tp_sem = CreateSemaphoreA(0, 0, 0x7fffffff, 0);
+    }
+    /* a worker is already on its way for every request not yet taken */
+    if (tp_pending > tp_idle + 1) return 1;
+    InterlockedIncrement(&tp_pending);
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    if (tp_idle == 0 && tp_threads < (LONG)(si.dwNumberOfProcessors < 2 ? 2 : si.dwNumberOfProcessors))
+    {
+        InterlockedIncrement(&tp_threads);
+        CloseHandle(CreateThread(0, 0, tp_worker, 0, 0, 0));
+    }
+    ReleaseSemaphore(tp_sem, 1, 0);
+    return 1;
+}
+static void ThreadPool_InitializeVMTp(uint8_t* tracking) { *tracking = 0; }
+static uint8_t ThreadPool_false(void) { return 0; }
+static uint8_t ThreadPool_true(void) { return 1; }
+static void ThreadPool_void(void) {}
+static void ThreadPool_ReportThreadStatus(uint8_t w) { (void)w; }
+static uint8_t ThreadPool_SetThreads(int32_t a, int32_t b) { (void)a; (void)b; return 1; }
+static void ThreadPool_GetThreads(int32_t* a, int32_t* b) { *a = 32; *b = 32; }
+static uint8_t ThreadPool_PostQueuedCompletionStatus(void* o) { (void)o; return 0; }
+static uint8_t ThreadPool_BindIO(intptr_t h) { (void)h; return 1; }
+
+static int64_t Timer_GetTimeMonotonic(void) { return DateTime_GetTimeMonotonic(); }
+
+/* ---- wait handles ---- */
+static intptr_t Event_Create4(uint8_t manual, uint8_t initial, void* name, int32_t* err)
+{
+    HANDLE h = CreateEventW(0, manual, initial, name ? (LPCWSTR)STR(name)->chars : 0);
+    *err = (int32_t)GetLastError();
+    if (*err != ERROR_ALREADY_EXISTS) *err = 0;
+    return (intptr_t)h;
+}
+static int32_t WaitHandle_Wait_internal(intptr_t* hs, int32_t n, uint8_t all, int32_t ms)
+{
+    DWORD r = n == 1 ? WaitForSingleObjectEx((HANDLE)hs[0], ms < 0 ? INFINITE : (DWORD)ms, FALSE)
+                     : WaitForMultipleObjectsEx((DWORD)n, (const HANDLE*)hs, all, ms < 0 ? INFINITE : (DWORD)ms, FALSE);
+    if (r == WAIT_TIMEOUT) return 258;
+    if (r >= WAIT_ABANDONED_0 && r < WAIT_ABANDONED_0 + (DWORD)n) return 0x80 + (int32_t)(r - WAIT_ABANDONED_0);
+    return (int32_t)(r - WAIT_OBJECT_0);
+}
+static int32_t WaitHandle_SignalAndWait4(intptr_t s, intptr_t w, int32_t ms)
+{
+    DWORD r = SignalObjectAndWait((HANDLE)s, (HANDLE)w, ms < 0 ? INFINITE : (DWORD)ms, FALSE);
+    return r == WAIT_TIMEOUT ? 258 : 0;
+}
+static intptr_t Mutex_Create4(uint8_t owned, void* name, uint8_t* created)
+{
+    HANDLE h = CreateMutexW(0, owned, name ? (LPCWSTR)STR(name)->chars : 0);
+    *created = GetLastError() != ERROR_ALREADY_EXISTS;
+    return (intptr_t)h;
+}
+static intptr_t Semaphore_Create4(int32_t init, int32_t max, void* name, int32_t* err)
+{
+    HANDLE h = CreateSemaphoreW(0, init, max, name ? (LPCWSTR)STR(name)->chars : 0);
+    *err = GetLastError() == ERROR_ALREADY_EXISTS ? ERROR_ALREADY_EXISTS : 0;
+    return (intptr_t)h;
+}
+static uint8_t Semaphore_Release4(intptr_t h, int32_t n, int32_t* prev)
+{
+    LONG p = 0;
+    BOOL ok = ReleaseSemaphore((HANDLE)h, n, &p);
+    *prev = (int32_t)p;
+    return ok != 0;
+}
+
+/* ---- GC ---- */
+static void* GC_get_ephemeron_tombstone(void)
+{
+    static void* tomb;
+    if (!tomb) { tomb = nr_new(nr_k_object); nr_gchandle_new(tomb, 0); }
+    return tomb;
+}
+/* ConditionalWeakTable's ephemerons. ponytail: kept as ordinary strong
+ * references (keys never die while their table lives); weak ephemerons if a
+ * title leaks through ConditionalWeakTable. */
+static void GC_register_ephemeron_array(void* a) { (void)a; }
+static int32_t GC_GetCollectionCount(int32_t g) { (void)g; return (int32_t)GC_get_gc_no(); }
+static int32_t GC_GetGeneration(void* o) { (void)o; return 0; }
+static void GC_RecordPressure(int64_t n) { (void)n; }
+
+/* ---- time ---- */
+static int64_t DateTime_GetSystemTimeAsFileTime(void)
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+}
+/* CurrentSystemTimeZone.GetTimeZoneData(int year, out long[] data, out string[] names, out bool daylight_inverted) */
+static uint8_t TimeZone_GetTimeZoneData4(int32_t year, void** data, void** names, uint8_t* inverted)
+{
+    *inverted = 0;
+    return TimeZone_GetTimeZoneData(year, data, names);
+}
+
+/* ---- environment ---- */
+static void* Environment_GetNewLine(void) { return nr_str_utf8("\r\n"); }
+static int32_t Environment_GetPageSize(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int32_t)si.dwPageSize; }
+static void* Environment_internalGetEnvironmentVariable_native(intptr_t utf8)
+{
+    if (!utf8) return 0;
+    int n = MultiByteToWideChar(CP_UTF8, 0, (const char*)utf8, -1, 0, 0);
+    wchar_t* w = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)utf8, -1, w, n);
+    void* r = Environment_internalGetEnvironmentVariable(nr_str_utf16((uint16_t*)w, n - 1));
+    free(w);
+    return r;
+}
+static void* Environment_internalGetHome(void) { return Environment_GetWindowsFolderPath(0x28); /* CSIDL_PROFILE */ }
+static uint8_t CLRConfig_false(void) { return 0; }
+static void* Process_ProcessName_internal(intptr_t h)
+{
+    (void)h;
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(0, buf, MAX_PATH);
+    wchar_t* b = buf + n;
+    while (b > buf && b[-1] != '\\') b--;
+    wchar_t* dot = wcsrchr(b, '.');
+    if (dot) *dot = 0;
+    return nr_str_utf16((uint16_t*)b, (int32_t)wcslen(b));
+}
+static intptr_t NativeMethods_GetCurrentProcess(void) { return (intptr_t)GetCurrentProcess(); }
+static int32_t NativeMethods_GetCurrentProcessId(void) { return (int32_t)GetCurrentProcessId(); }
+static uint8_t NativeMethods_GetExitCodeProcess(intptr_t h, int32_t* code) { DWORD c = 0; BOOL ok = GetExitCodeProcess((HANDLE)h, &c); *code = (int32_t)c; return ok != 0; }
+static uint8_t NativeMethods_CloseProcess(intptr_t h) { return CloseHandle((HANDLE)h) != 0; }
+static uint8_t Debugger_false(void) { return 0; }
+static void Debugger_Log(int32_t level, void* cat, void* msg) { (void)level; (void)cat; if (msg) OutputDebugStringW((LPCWSTR)STR(msg)->chars); }
+static void DefaultTraceListener_WriteWindowsDebugString(void* msg) { if (msg) OutputDebugStringW((LPCWSTR)STR(msg)->chars); }
+
+/* SafeStringMarshal: UTF-8 copies the class library hands to icalls */
+static intptr_t SafeStringMarshal_StringToUtf8(void* s) { return (intptr_t)(s ? nr_utf8(s) : 0); }
+static void SafeStringMarshal_GFree(intptr_t p) { nr_free((void*)p); }
+static void GPtrArray_Free(void* a)
+{
+    if (!a) return;
+    free(((void**)a)[0]);
+    free(a);
+}
+
+
+/* ---- Buffer / Math ---- */
+static uint8_t Buffer_InternalBlockCopy(void* src, int32_t so, void* dst, int32_t d0, int32_t count) { return Buffer_BlockCopyInternal(src, so, dst, d0, count); }
+static int32_t Buffer_ByteLength4(void* a) { return Buffer_ByteLengthInternal(a); }
+static double Math_SplitFractionDouble(double* v) { double ip; double f = modf(*v, &ip); *v = ip; return f; }
+static double Math_Round4(double d) { return Math_Round(d); }
+
+/* ---- Decimal: the .NET layout {flags, hi, lo, mid} is OLE's DECIMAL ---- */
+static void dec_check(HRESULT hr) { if (hr == DISP_E_OVERFLOW) nr_throw_new("System", "OverflowException", "Value was either too large or too small for a Decimal."); if (hr == DISP_E_DIVBYZERO) nr_throw_divzero(); }
+static void Decimal_ctor_r8(DECIMAL* d, double v) { dec_check(VarDecFromR8(v, d)); }
+static void Decimal_ctor_r4(DECIMAL* d, float v) { dec_check(VarDecFromR4(v, d)); }
+static void Decimal_FCallAddSub(DECIMAL* a, DECIMAL* b, uint8_t sub)
+{
+    DECIMAL r;
+    if (sub) { DECIMAL nb; VarDecNeg(b, &nb); dec_check(VarDecAdd(a, &nb, &r)); }
+    else dec_check(VarDecAdd(a, b, &r));
+    *a = r;
+}
+static void Decimal_FCallMultiply(DECIMAL* a, DECIMAL* b) { DECIMAL r; dec_check(VarDecMul(a, b, &r)); *a = r; }
+static void Decimal_FCallDivide(DECIMAL* a, DECIMAL* b) { DECIMAL r; dec_check(VarDecDiv(a, b, &r)); *a = r; }
+static int32_t Decimal_FCallCompare(DECIMAL* a, DECIMAL* b) { return (int32_t)VarDecCmp(a, b) - 1; }
+static void Decimal_FCallFloor(DECIMAL* a) { DECIMAL r; VarDecInt(a, &r); *a = r; }
+static void Decimal_FCallTruncate(DECIMAL* a) { DECIMAL r; VarDecFix(a, &r); *a = r; }
+static void Decimal_FCallRound(DECIMAL* a, int32_t n) { DECIMAL r; dec_check(VarDecRound(a, n, &r)); *a = r; }
+static int32_t Decimal_FCallToInt32(DECIMAL d) { LONG v; DECIMAL t; VarDecFix(&d, &t); if (VarI4FromDec(&t, &v)) nr_throw_new("System", "OverflowException", "Value was either too large or too small for an Int32."); return v; }
+static double Decimal_ToDouble(DECIMAL d) { double v; VarR8FromDec(&d, &v); return v; }
+static float Decimal_ToSingle(DECIMAL d) { float v; VarR4FromDec(&d, &v); return v; }
+static int32_t Decimal_GetHashCode(DECIMAL* d) { double v; VarR8FromDec(d, &v); if (v == 0) return 0; int64_t b; memcpy(&b, &v, 8); return (int32_t)b ^ (int32_t)(b >> 32); }
+
+/* Number.NumberBufferToDouble(byte* numberBuffer, ref double value): the
+ * buffer PackForNative hands over is { int precision; int scale; int sign; }
+ * followed by the NUL-terminated UTF-16 digits. */
+typedef struct NumBuf { int32_t precision, scale, sign; uint16_t digits[1]; } NumBuf;
+static uint8_t Number_NumberBufferToDouble(NumBuf* nb, double* v)
+{
+    char buf[400]; int n = 0;
+    if (nb->sign) buf[n++] = '-';
+    buf[n++] = '0'; buf[n++] = '.';
+    const uint16_t* d = nb->digits;
+    while (*d && n < 360) buf[n++] = (char)*d++;
+    n += sprintf(buf + n, "e%d", nb->scale);
+    buf[n] = 0;
+    *v = strtod(buf, 0);
+    return 1;
+}
+static uint8_t Number_NumberBufferToDecimal(NumBuf* nb, DECIMAL* v)
+{
+    wchar_t buf[400]; int n = 0;
+    if (nb->sign) buf[n++] = '-';
+    const uint16_t* d = nb->digits;
+    int digits = 0;
+    while (*d && n < 360) { buf[n++] = *d++; digits++; }
+    if (!digits) buf[n++] = '0';
+    int exp = nb->scale - digits;
+    while (exp > 0) { buf[n++] = '0'; exp--; }
+    buf[n] = 0;
+    DECIMAL r;
+    if (VarDecFromStr(buf, LOCALE_INVARIANT, 0, &r)) return 0;
+    if (exp < 0) { DECIMAL p; VarDecFromI4(1, &p); for (int i = 0; i < -exp && i < 28; i++) { DECIMAL ten, t; VarDecFromI4(10, &ten); VarDecMul(&p, &ten, &t); p = t; } DECIMAL q; if (VarDecDiv(&r, &p, &q)) return 0; r = q; }
+    *v = r;
+    return 1;
+}
+
+/* ---- Enum ---- */
+static uint64_t enum_raw(NrClass* u, const void* p)
+{
+    switch (u->byval_arg.type)
+    {
+    case 2: case 5: return *(const uint8_t*)p;
+    case 4: return (uint64_t)(int64_t)*(const int8_t*)p;
+    case 3: case 7: return *(const uint16_t*)p;
+    case 6: return (uint64_t)(int64_t)*(const int16_t*)p;
+    case 8: return (uint64_t)(int64_t)*(const int32_t*)p;
+    case 9: return *(const uint32_t*)p;
+    default: return *(const uint64_t*)p;
+    }
+}
+static uint8_t Enum_GetEnumValuesAndNames(void* t, void** values, void** names)
+{
+    NrClass* k = nr_type_class(t);
+    NrClass* u = k->elem;
+    int n = 0;
+    for (int i = 0; i < k->n_fields; i++) if ((k->fields[i].flags & 0x10) && k->fields[i].rva) n++;
+    void* va = nr_newarr(nr_array_class(nr_class_by_name("System", "UInt64"), 1), n);
+    void* na = nr_new_string_array(n);
+    int j = 0;
+    for (int i = 0; i < k->n_fields; i++)
+    {
+        const NrFieldDesc* f = &k->fields[i];
+        if (!(f->flags & 0x10) || !f->rva) continue;
+        ((uint64_t*)ARR(va)->vector)[j] = enum_raw(u, f->rva);
+        ((void**)ARR(na)->vector)[j] = nr_str_utf8(f->name);
+        j++;
+    }
+    *values = va; *names = na;
+    return 0;   /* not sorted: the caller sorts by value */
+}
+static void* Enum_InternalBoxEnum(void* t, int64_t v) { return nr_box(nr_type_class(t), &v); }
+static void* Enum_InternalGetUnderlyingType(void* t) { return nr_type_object(nr_type_class(t)->elem); }
+static int32_t Enum_InternalCompareTo(void* a, void* b)
+{
+    NrClass* u = OBJ(a)->klass->elem;
+    uint64_t x = enum_raw(u, (char*)a + sizeof(NrObj)), y = enum_raw(u, (char*)b + sizeof(NrObj));
+    uint8_t ty = u->byval_arg.type;
+    if (ty == 4 || ty == 6 || ty == 8 || ty == 0xa) return (int64_t)x < (int64_t)y ? -1 : (int64_t)x > (int64_t)y;
+    return x < y ? -1 : x > y;
+}
+
+/* ---- MonoIO: paths arrive as char* (UTF-16, NUL-terminated) ---- */
+static intptr_t MonoIO_Open4(const wchar_t* path, int32_t mode, int32_t access, int32_t share, int32_t options, int32_t* err)
+{
+    return MonoIO_Open(nr_str_from_utf16z((const uint16_t*)path), mode, access, share, options, err);
+}
+#define WPATH(p) nr_str_from_utf16z((const uint16_t*)(p))
+static int32_t MonoIO_GetFileAttributes4(const wchar_t* p, int32_t* err) { DWORD a = GetFileAttributesW(p); *err = a == INVALID_FILE_ATTRIBUTES ? io_err() : 0; return (int32_t)a; }
+static uint8_t MonoIO_SetFileAttributes4(const wchar_t* p, int32_t attrs, int32_t* err) { BOOL ok = SetFileAttributesW(p, (DWORD)attrs); *err = ok ? 0 : io_err(); return ok != 0; }
+typedef struct MonoIOStat4 { int32_t attrs; int64_t length, ctime, atime, mtime; } MonoIOStat4;
+static uint8_t MonoIO_GetFileStat4(const wchar_t* p, MonoIOStat4* st, int32_t* err)
+{
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(p, GetFileExInfoStandard, &d)) { *err = io_err(); memset(st, 0, sizeof *st); return 0; }
+    st->attrs = (int32_t)d.dwFileAttributes;
+    st->length = (int64_t)(((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+    st->ctime = ft_ticks(d.ftCreationTime) - TICKS_1601; st->atime = ft_ticks(d.ftLastAccessTime) - TICKS_1601; st->mtime = ft_ticks(d.ftLastWriteTime) - TICKS_1601;
+    *err = 0;
+    return 1;
+}
+static uint8_t MonoIO_CreateDirectory4(const wchar_t* p, int32_t* err) { BOOL ok = CreateDirectoryW(p, 0); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_RemoveDirectory4(const wchar_t* p, int32_t* err) { BOOL ok = RemoveDirectoryW(p); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_DeleteFile4(const wchar_t* p, int32_t* err) { BOOL ok = DeleteFileW(p); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_MoveFile4(const wchar_t* a, const wchar_t* b, int32_t* err) { BOOL ok = MoveFileW(a, b); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_CopyFile4(const wchar_t* a, const wchar_t* b, uint8_t ow, int32_t* err) { BOOL ok = CopyFileW(a, b, !ow); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_ReplaceFile4(const wchar_t* src, const wchar_t* dst, const wchar_t* bak, uint8_t ign, int32_t* err) { (void)ign; BOOL ok = ReplaceFileW(dst, src, bak, 0, 0, 0); *err = ok ? 0 : io_err(); return ok != 0; }
+static uint8_t MonoIO_SetCurrentDirectory4(const wchar_t* p, int32_t* err) { BOOL ok = SetCurrentDirectoryW(p); *err = ok ? 0 : io_err(); return ok != 0; }
+/* FindFirstFile(char* pattern, out string fileName, out int attrs, out int error) -> handle */
+static intptr_t MonoIO_FindFirstFile(const wchar_t* pat, void** name, int32_t* attrs, int32_t* err)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) { *name = 0; *attrs = 0; *err = io_err(); return -1; }
+    *name = nr_str_utf16((uint16_t*)fd.cFileName, (int32_t)wcslen(fd.cFileName));
+    *attrs = (int32_t)fd.dwFileAttributes; *err = 0;
+    return (intptr_t)h;
+}
+static uint8_t MonoIO_FindNextFile(intptr_t h, void** name, int32_t* attrs, int32_t* err)
+{
+    WIN32_FIND_DATAW fd;
+    if (!FindNextFileW((HANDLE)h, &fd)) { *name = 0; *attrs = 0; *err = io_err(); return 0; }
+    *name = nr_str_utf16((uint16_t*)fd.cFileName, (int32_t)wcslen(fd.cFileName));
+    *attrs = (int32_t)fd.dwFileAttributes; *err = 0;
+    return 1;
+}
+static uint8_t MonoIO_FindCloseFile(intptr_t h) { return FindClose((HANDLE)h) != 0; }
+static uint8_t MonoIO_RemapPath(void* path, void** out) { (void)path; *out = 0; return 0; }
+static void MonoIO_DumpHandles(void) {}
+static uint8_t MonoIO_DuplicateHandle(intptr_t sp, intptr_t sh, intptr_t tp, intptr_t* th, int32_t acc, int32_t inh, int32_t opt, int32_t* err)
+{
+    HANDLE out = 0;
+    BOOL ok = DuplicateHandle((HANDLE)sp, (HANDLE)sh, (HANDLE)tp, &out, (DWORD)acc, inh, (DWORD)opt);
+    *th = (intptr_t)out; *err = ok ? 0 : io_err();
+    return ok != 0;
+}
+
+/* ---- culture: invariant only (CultureInfo falls back to it) ---- */
+static void* CultureInfo_get_current_locale_name(void) { return 0; }
+static void* CultureInfo_internal_get_cultures(uint8_t n, uint8_t s, uint8_t i) { (void)n; (void)s; (void)i; return nr_newarr(nr_array_class(nr_class_by_name("System.Globalization", "CultureInfo"), 1), 0); }
+static uint8_t CultureData_fill_culture_data(void* self, int32_t idx) { (void)self; (void)idx; return 0; }
+static void CultureData_fill_number_data(void* nfi, int32_t idx) { (void)nfi; (void)idx; }
+static uint8_t CalendarData_fill_calendar_data(void* self, void* name, int32_t id) { (void)self; (void)name; (void)id; return 0; }
+static void CompareInfo_assign_sortkey4(void* self, void* key, void* src, int32_t opts) { CompareInfo_assign_sortkey(self, key, src, opts); }
+static void Normalization_load_resource(intptr_t* a, intptr_t* b, intptr_t* c, intptr_t* d, intptr_t* e, intptr_t* f)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+    nr_throw_notsupported("string normalization tables");
+}
+
+/* ---- AppDomain ---- */
+static void* AppDomain_InternalGetProcessGuid(void* g) { static void* guid; if (!guid) { guid = g; nr_gchandle_new(g, 0); } return guid; }
+static uint8_t AppDomain_false_i(int32_t id) { (void)id; return 0; }
+static void AppDomain_void0(void) {}
+static void AppDomain_void1(void* a) { (void)a; }
+static void AppDomain_void_i(int32_t a) { (void)a; }
+static void* AppDomain_InternalSetDomain(void* d) { return d; }
+static void* AppDomain_InternalSetDomainByID(int32_t id) { (void)id; return AppDomain_getCurDomain(); }
+
+/* ---- Marshal / GCHandle ---- */
+static void* Marshal_GetDelegateForFunctionPointerInternal(intptr_t fn, void* t)
+{
+    NrClass* k = nr_type_class(t);
+    void* d = nr_new(k);
+    nr_delegate_init(d, 0, (void*)fn, 0);
+    return d;
+}
+static intptr_t Marshal_GetFunctionPointerForDelegateInternal(void* d) { return (intptr_t)nr_delegate_to_fnptr(d); }
+static void Marshal_Prelink(void* m) { (void)m; }
+static int32_t Marshal_com_unsupported(intptr_t p) { (void)p; nr_throw_notsupported("COM interop"); }
+static int32_t Marshal_GetHRForException_WinRT(void* e) { (void)e; return 0; }
+static intptr_t Marshal_GetIUnknownForObjectInternal(void* o) { (void)o; nr_throw_notsupported("COM interop"); }
+static int32_t Marshal_QueryInterfaceInternal(intptr_t p, void* iid, intptr_t* out) { (void)p; (void)iid; *out = 0; return (int32_t)0x80004002; }
+
+/* ---- Delegate ---- */
+static void* Delegate_AllocDelegateLike_internal(void* d)
+{
+    NrClass* k = OBJ(d)->klass;
+    void* r = nr_new(k);
+    memcpy((char*)r + sizeof(NrObj), (char*)d + sizeof(NrObj), (size_t)k->instance_size - sizeof(NrObj));
+    ((NrDelegate*)r)->delegates = 0;
+    return r;
+}
+static void* Delegate_GetVirtualMethod_internal(void* d)
+{
+    NrDelegate* dl = (NrDelegate*)d;
+    return dl->method ? nr_method_object((const NrMethodDesc*)dl->method) : 0;
+}
+
+static void* ActivationServices_AllocateUninitializedClassInstance(void* t) { return nr_new(nr_type_class(t)); }
+static void ActivationServices_EnableProxyActivation(void* t, uint8_t e) { (void)t; (void)e; }
+static uint8_t RemotingServices_IsTransparentProxy(void* o) { (void)o; return 0; }
+static void* TypedReference_MakeTypedReferenceInternal(void* target, void* fields) { (void)target; (void)fields; nr_throw_notsupported("TypedReference"); }
+
+static void nr_register_corlib4_icalls(void)
+{
+    static const NrIcall t[] = {
+        { "System.String::FastAllocateString", String_FastAllocateString },
+        { "System.Threading.Monitor::try_enter_with_atomic_var", Monitor_try_enter_with_atomic_var },
+        { "System.Threading.Interlocked::CompareExchange(int&,int,int,bool&)", IL_CmpXchg_i4b },
+        { "System.Threading.Volatile::Read(bool&)", Vol_Read_u1 },
+        { "System.Threading.Volatile::Read(int&)", VR_i4 },
+        { "System.Threading.Volatile::Read(T&)", Vol_Read_T },
+        { "System.Threading.Volatile::Write(int&,int)", VW_i4 },
+        { "System.Threading.Volatile::Write(T&,T)", Vol_Write_T },
+        { "System.Threading.Thread::ConstructInternalThread", Thread_ConstructInternalThread },
+        { "System.Threading.Thread::GetCurrentThread", Thread_GetCurrentThread },
+        { "System.Threading.Thread::SleepInternal", Thread_SleepInternal },
+        { "System.Threading.Thread::YieldInternal", Thread_YieldInternal },
+        { "System.Threading.Thread::SystemMaxStackStize", Thread_SystemMaxStackStize },
+        { "System.Threading.Thread::JoinInternal", Thread_JoinInternal },
+        { "System.Threading.Thread::SetPriorityNative", Thread_SetPriorityNative },
+        { "System.Threading.Thread::GetPriorityNative", Thread_GetPriorityNative },
+        { "System.Threading.Thread::GetAbortExceptionState", Thread_GetAbortExceptionState },
+        { "System.Threading.Thread::ByteArrayToRootDomain", Thread_ByteArrayToDomain },
+        { "System.Threading.Thread::ByteArrayToCurrentDomain", Thread_ByteArrayToDomain },
+        { "System.Threading.Thread::InterruptInternal", Thread_InterruptInternal },
+        { "System.Threading.Thread::VolatileRead(intptr&)", VR_ip },
+        { "System.Threading.Thread::VolatileWrite(intptr&,intptr)", VW_ip },
+        { "System.Threading.ThreadPool::RequestWorkerThread", ThreadPool_RequestWorkerThread },
+        { "System.Threading.ThreadPool::InitializeVMTp", ThreadPool_InitializeVMTp },
+        { "System.Threading.ThreadPool::IsThreadPoolHosted", ThreadPool_false },
+        { "System.Threading.ThreadPool::NotifyWorkItemComplete", ThreadPool_true },
+        { "System.Threading.ThreadPool::NotifyWorkItemProgressNative", ThreadPool_void },
+        { "System.Threading.ThreadPool::ReportThreadStatus", ThreadPool_ReportThreadStatus },
+        { "System.Threading.ThreadPool::SetMinThreadsNative", ThreadPool_SetThreads },
+        { "System.Threading.ThreadPool::SetMaxThreadsNative", ThreadPool_SetThreads },
+        { "System.Threading.ThreadPool::GetMinThreadsNative", ThreadPool_GetThreads },
+        { "System.Threading.ThreadPool::GetMaxThreadsNative", ThreadPool_GetThreads },
+        { "System.Threading.ThreadPool::GetAvailableThreadsNative", ThreadPool_GetThreads },
+        { "System.Threading.ThreadPool::PostQueuedCompletionStatus", ThreadPool_PostQueuedCompletionStatus },
+        { "System.Threading.ThreadPool::BindIOCompletionCallbackNative", ThreadPool_BindIO },
+        { "System.Threading.Timer::GetTimeMonotonic", Timer_GetTimeMonotonic },
+        { "System.Threading.NativeEventCalls::CreateEvent_internal", Event_Create4 },
+        { "System.Threading.WaitHandle::Wait_internal", WaitHandle_Wait_internal },
+        { "System.Threading.WaitHandle::SignalAndWait_Internal", WaitHandle_SignalAndWait4 },
+        { "System.Threading.Mutex::CreateMutex_internal", Mutex_Create4 },
+        { "System.Threading.Semaphore::CreateSemaphore_internal", Semaphore_Create4 },
+        { "System.Threading.Semaphore::ReleaseSemaphore_internal", Semaphore_Release4 },
+        { "System.GC::_SuppressFinalize", GC_SuppressFinalize },
+        { "System.GC::_ReRegisterForFinalize", GC_ReRegisterForFinalize },
+        { "System.GC::GetCollectionCount", GC_GetCollectionCount },
+        { "System.GC::get_ephemeron_tombstone", GC_get_ephemeron_tombstone },
+        { "System.GC::register_ephemeron_array", GC_register_ephemeron_array },
+        { "System.GC::GetGeneration", GC_GetGeneration },
+        { "System.GC::RecordPressure", GC_RecordPressure },
+        { "System.GC::_Collect", GC_InternalCollect },
+        { "System.DateTime::GetSystemTimeAsFileTime", DateTime_GetSystemTimeAsFileTime },
+        { "System.CurrentSystemTimeZone::GetTimeZoneData", TimeZone_GetTimeZoneData4 },
+        { "System.Environment::GetNewLine", Environment_GetNewLine },
+        { "System.Environment::GetPageSize", Environment_GetPageSize },
+        { "System.Environment::internalGetEnvironmentVariable_native", Environment_internalGetEnvironmentVariable_native },
+        { "System.Environment::internalGetHome", Environment_internalGetHome },
+        { "System.CLRConfig::CheckThrowUnobservedTaskExceptions", CLRConfig_false },
+        { "System.Diagnostics.Process::ProcessName_internal", Process_ProcessName_internal },
+        { "Microsoft.Win32.NativeMethods::GetCurrentProcess", NativeMethods_GetCurrentProcess },
+        { "Microsoft.Win32.NativeMethods::GetCurrentProcessId", NativeMethods_GetCurrentProcessId },
+        { "Microsoft.Win32.NativeMethods::GetExitCodeProcess", NativeMethods_GetExitCodeProcess },
+        { "Microsoft.Win32.NativeMethods::CloseProcess", NativeMethods_CloseProcess },
+        { "System.Diagnostics.Debugger::IsAttached_internal", Debugger_false },
+        { "System.Diagnostics.Debugger::IsLogging", Debugger_false },
+        { "System.Diagnostics.Debugger::Log", Debugger_Log },
+        { "System.Diagnostics.DefaultTraceListener::WriteWindowsDebugString", DefaultTraceListener_WriteWindowsDebugString },
+        { "Mono.SafeStringMarshal::StringToUtf8", SafeStringMarshal_StringToUtf8 },
+        { "Mono.SafeStringMarshal::GFree", SafeStringMarshal_GFree },
+        { "Mono.RuntimeGPtrArrayHandle::GPtrArrayFree", GPtrArray_Free },
+        { "System.Text.EncodingHelper::InternalCodePage", Encoding_InternalCodePage },
+        { "System.Buffer::InternalBlockCopy", Buffer_InternalBlockCopy },
+        { "System.Buffer::_ByteLength", Buffer_ByteLength4 },
+        { "System.Math::SplitFractionDouble", Math_SplitFractionDouble },
+        { "System.Math::Round", Math_Round4 },
+        { "System.Decimal::.ctor(double)", Decimal_ctor_r8 },
+        { "System.Decimal::.ctor(single)", Decimal_ctor_r4 },
+        { "System.Decimal::FCallAddSub", Decimal_FCallAddSub },
+        { "System.Decimal::FCallMultiply", Decimal_FCallMultiply },
+        { "System.Decimal::FCallDivide", Decimal_FCallDivide },
+        { "System.Decimal::FCallCompare", Decimal_FCallCompare },
+        { "System.Decimal::FCallFloor", Decimal_FCallFloor },
+        { "System.Decimal::FCallTruncate", Decimal_FCallTruncate },
+        { "System.Decimal::FCallRound", Decimal_FCallRound },
+        { "System.Decimal::FCallToInt32", Decimal_FCallToInt32 },
+        { "System.Decimal::ToDouble", Decimal_ToDouble },
+        { "System.Decimal::ToSingle", Decimal_ToSingle },
+        { "System.Decimal::GetHashCode", Decimal_GetHashCode },
+        { "System.Number::NumberBufferToDouble", Number_NumberBufferToDouble },
+        { "System.Number::NumberBufferToDecimal", Number_NumberBufferToDecimal },
+        { "System.Enum::GetEnumValuesAndNames", Enum_GetEnumValuesAndNames },
+        { "System.Enum::InternalBoxEnum", Enum_InternalBoxEnum },
+        { "System.Enum::InternalGetUnderlyingType", Enum_InternalGetUnderlyingType },
+        { "System.Enum::InternalCompareTo", Enum_InternalCompareTo },
+        { "System.IO.MonoIO::Open", MonoIO_Open4 },
+        { "System.IO.MonoIO::GetFileAttributes", MonoIO_GetFileAttributes4 },
+        { "System.IO.MonoIO::SetFileAttributes", MonoIO_SetFileAttributes4 },
+        { "System.IO.MonoIO::GetFileStat", MonoIO_GetFileStat4 },
+        { "System.IO.MonoIO::CreateDirectory", MonoIO_CreateDirectory4 },
+        { "System.IO.MonoIO::RemoveDirectory", MonoIO_RemoveDirectory4 },
+        { "System.IO.MonoIO::DeleteFile", MonoIO_DeleteFile4 },
+        { "System.IO.MonoIO::MoveFile", MonoIO_MoveFile4 },
+        { "System.IO.MonoIO::CopyFile", MonoIO_CopyFile4 },
+        { "System.IO.MonoIO::ReplaceFile", MonoIO_ReplaceFile4 },
+        { "System.IO.MonoIO::SetCurrentDirectory", MonoIO_SetCurrentDirectory4 },
+        { "System.IO.MonoIO::FindFirstFile", MonoIO_FindFirstFile },
+        { "System.IO.MonoIO::FindNextFile", MonoIO_FindNextFile },
+        { "System.IO.MonoIO::FindCloseFile", MonoIO_FindCloseFile },
+        { "System.IO.MonoIO::RemapPath", MonoIO_RemapPath },
+        { "System.IO.MonoIO::DumpHandles", MonoIO_DumpHandles },
+        { "System.IO.MonoIO::DuplicateHandle", MonoIO_DuplicateHandle },
+        { "System.Globalization.CultureInfo::get_current_locale_name", CultureInfo_get_current_locale_name },
+        { "System.Globalization.CultureInfo::internal_get_cultures", CultureInfo_internal_get_cultures },
+        { "System.Globalization.CultureData::fill_culture_data", CultureData_fill_culture_data },
+        { "System.Globalization.CultureData::fill_number_data", CultureData_fill_number_data },
+        { "System.Globalization.CalendarData::fill_calendar_data", CalendarData_fill_calendar_data },
+        { "System.Globalization.CompareInfo::assign_sortkey", CompareInfo_assign_sortkey4 },
+        { "System.Text.Normalization::load_normalization_resource", Normalization_load_resource },
+        { "System.AppDomain::InternalGetProcessGuid", AppDomain_InternalGetProcessGuid },
+        { "System.AppDomain::InternalIsFinalizingForUnload", AppDomain_false_i },
+        { "System.AppDomain::InternalPopDomainRef", AppDomain_void0 },
+        { "System.AppDomain::InternalPushDomainRef", AppDomain_void1 },
+        { "System.AppDomain::InternalPushDomainRefByID", AppDomain_void_i },
+        { "System.AppDomain::InternalSetDomain", AppDomain_InternalSetDomain },
+        { "System.AppDomain::InternalSetDomainByID", AppDomain_InternalSetDomainByID },
+        { "System.Runtime.InteropServices.Marshal::GetDelegateForFunctionPointerInternal", Marshal_GetDelegateForFunctionPointerInternal },
+        { "System.Runtime.InteropServices.Marshal::GetFunctionPointerForDelegateInternal", Marshal_GetFunctionPointerForDelegateInternal },
+        { "System.Runtime.InteropServices.Marshal::Prelink", Marshal_Prelink },
+        { "System.Runtime.InteropServices.Marshal::AddRefInternal", Marshal_com_unsupported },
+        { "System.Runtime.InteropServices.Marshal::ReleaseInternal", Marshal_com_unsupported },
+        { "System.Runtime.InteropServices.Marshal::GetHRForException_WinRT", Marshal_GetHRForException_WinRT },
+        { "System.Runtime.InteropServices.Marshal::GetIUnknownForObjectInternal", Marshal_GetIUnknownForObjectInternal },
+        { "System.Runtime.InteropServices.Marshal::QueryInterfaceInternal", Marshal_QueryInterfaceInternal },
+        { "System.Delegate::AllocDelegateLike_internal", Delegate_AllocDelegateLike_internal },
+        { "System.Delegate::GetVirtualMethod_internal", Delegate_GetVirtualMethod_internal },
+        { "System.Runtime.Remoting.Activation.ActivationServices::AllocateUninitializedClassInstance", ActivationServices_AllocateUninitializedClassInstance },
+        { "System.Runtime.Remoting.Activation.ActivationServices::EnableProxyActivation", ActivationServices_EnableProxyActivation },
+        { "System.Runtime.Remoting.RemotingServices::IsTransparentProxy", RemotingServices_IsTransparentProxy },
+        { "System.TypedReference::MakeTypedReferenceInternal", TypedReference_MakeTypedReferenceInternal },
+    };
+    nr_register_icalls(t, (int)(sizeof t / sizeof t[0]));
+}
+#endif

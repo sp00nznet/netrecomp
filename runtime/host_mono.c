@@ -73,7 +73,10 @@ static void ensure_init(void)
 
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
 void nr_input_start(void);
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); return &root_domain; }
+void nr_mute_start(void);
+static DWORD shot_thread;     /* NR_SHOT, see shot_poll */
+static ULONGLONG shot_t0;
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); shot_thread = GetCurrentThreadId(); shot_t0 = GetTickCount64(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
@@ -230,7 +233,7 @@ API NrImage* mono_assembly_loaded(const char** aname)
     for (int i = 0; i < nr_n_images; i++) if (!_stricmp(nr_images[i]->name, *aname)) return nr_images[i];
     return 0;
 }
-API gboolean mono_assembly_fill_assembly_name(NrImage* img, const char** aname) { TR("mono_assembly_fill_assembly_name"); *aname = img->name; return 1; }
+API gboolean mono_assembly_fill_assembly_name(NrImage* img, const char** aname) { TR("mono_assembly_fill_assembly_name"); *aname = _strdup(img->name); return 1; }
 API char* mono_stringify_assembly_name(const char** aname) { TR("mono_stringify_assembly_name"); return _strdup(*aname); }
 API void* mono_assembly_get_object(NrDomain* d, NrImage* a) { TR("mono_assembly_get_object"); (void)d; return nr_assembly_object(a); }
 
@@ -466,8 +469,8 @@ API uint32_t mono_object_get_size(void* o)
 {
     TR("mono_object_get_size");
     NrClass* k = ((NrObj*)o)->klass;
-    if (k == nr_k_string) return 12 + 2 * ((uint32_t)((NrString*)o)->length + 1);
-    if (k->flags & NR_ARRAY) return 16 + (uint32_t)k->elem_size * ((NrArray*)o)->max_length;
+    if (k == nr_k_string) return (uint32_t)offsetof(NrString, chars) + 2 * ((uint32_t)((NrString*)o)->length + 1);
+    if (k->flags & NR_ARRAY) return (uint32_t)offsetof(NrArray, vector) + (uint32_t)k->elem_size * ((NrArray*)o)->max_length;
     return (uint32_t)k->instance_size;
 }
 API void mono_runtime_object_init(void* o)
@@ -484,9 +487,46 @@ API void mono_runtime_object_init(void* o)
         }
 }
 
+/* NR_SHOT=5,20,60 (seconds after start) with NR_SHOT_DIR: the engine saves a
+ * screenshot of itself then (ScreenCapture.CaptureScreenshot, on the main
+ * thread). Works where a window can't be captured from outside, such as a
+ * D3D window on a hidden desktop. */
+static int shot_next;
+static void shot_poll(const NrMethodDesc* m)
+{
+    static double when[32]; static int n = -1;
+    static char dir[MAX_PATH];
+    static const NrMethodDesc* cap;
+    if (n < 0)
+    {
+        char v[256];
+        n = 0;
+        if (!GetEnvironmentVariableA("NR_SHOT", v, sizeof v) || !GetEnvironmentVariableA("NR_SHOT_DIR", dir, sizeof dir)) return;
+        for (char* p = strtok(v, ","); p && n < 32; p = strtok(0, ",")) when[n++] = atof(p);
+        NrClass* k = nr_class_by_name("UnityEngine", "ScreenCapture");
+        for (int i = 0; k && i < k->n_methods; i++)
+            if (!strcmp(k->methods[i].name, "CaptureScreenshot") && k->methods[i].n_params == 1 && k->methods[i].params[0] == nr_k_string) cap = &k->methods[i];
+        nr_log("netrecomp: NR_SHOT armed, %d shot(s)%s\n", n, cap ? "" : " (no capture method)");
+        if (!cap) { nr_log("netrecomp: NR_SHOT: no ScreenCapture.CaptureScreenshot(string)\n"); n = 0; }
+    }
+    /* the main thread is the one Unity runs Update and coroutines on */
+    if (shot_next >= n || !m || (strcmp(m->name, "Update") && strcmp(m->name, "InvokeMoveNext"))) return;
+    double t = (double)(GetTickCount64() - shot_t0) / 1000.0;
+    if (t < when[shot_next]) return;
+    char path[MAX_PATH + 32];
+    _snprintf(path, sizeof path, "%s/shot_%03d.png", dir, (int)when[shot_next]);
+    path[sizeof path - 1] = 0;
+    shot_next++;
+    void* args[1] = { nr_str_utf8(path) };
+    void* ex = 0;
+    nr_invoke(cap, 0, args, &ex);
+    nr_log("netrecomp: NR_SHOT %s%s\n", path, ex ? " (threw)" : "");
+}
+
 API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, void** exc)
 {
     TR("mono_runtime_invoke");
+    shot_poll(m);
     if (!m) { if (exc) *exc = 0; return 0; }
     void* r = nr_invoke(m, obj, params, exc);
     if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
@@ -586,8 +626,10 @@ API int64_t mono_gc_get_used_size(void) { TR("mono_gc_get_used_size"); return (i
  * first word is a class record counts as a reference. Over-reporting only
  * keeps an asset loaded; under-reporting unloads one that is still in use. */
 typedef void (*LivenessCb)(void** objs, int n, void* user);
+typedef void (*WorldCb)(void);
 typedef struct Liveness {
     NrClass* filter; LivenessCb cb; void* user;
+    WorldCb on_start, on_stop;    /* Unity 2017+: called around the stopped world */
     void** out; uint32_t n_out, max_out;
     void** seen; uint32_t seen_cap, n_seen;    /* open-addressing set */
     void** work; uint32_t n_work, work_cap;
@@ -644,21 +686,34 @@ static void live_scan(Liveness* s, void* const* from, size_t words)
         for (size_t i = 2; i < n; i++) live_push(s, o[i]);
     }
 }
-API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, LivenessCb cb, void* user)
+/* Unity 4 passes the first four arguments; 2017+ adds the world callbacks,
+ * which mono calls as it stops and restarts the world. */
+API void* mono_unity_liveness_calculation_begin(NrClass* filter, uint32_t max, LivenessCb cb, void* user, WorldCb on_start, WorldCb on_stop)
 {
     TR("mono_unity_liveness_calculation_begin");
     Liveness* s = (Liveness*)calloc(1, sizeof *s);
     s->filter = filter; s->cb = cb; s->user = user;
+#if NR_CORLIB4
+    s->on_start = on_start; s->on_stop = on_stop;
+#else
+    (void)on_start; (void)on_stop;
+#endif
     s->max_out = max && max < 64 ? max : 64;
     s->out = (void**)malloc(s->max_out * sizeof(void*));
+    if (s->on_stop) s->on_stop();
     GC_disable();   /* nothing is freed while the walk holds raw pointers */
     return s;
 }
+API void mono_unity_liveness_finalize(Liveness* s) { TR("mono_unity_liveness_finalize"); live_flush(s); }
+API void mono_unity_liveness_stop_gc_world(Liveness* s) { TR("mono_unity_liveness_stop_gc_world"); (void)s; }
+API void mono_unity_liveness_start_gc_world(Liveness* s) { TR("mono_unity_liveness_start_gc_world"); (void)s; }
+API void mono_unity_liveness_free_struct(Liveness* s) { TR("mono_unity_liveness_free_struct"); free(s->out); free(s->seen); free(s->work); free(s); }
 API void mono_unity_liveness_calculation_end(Liveness* s)
 {
     TR("mono_unity_liveness_calculation_end");
     live_flush(s);
     GC_enable();
+    if (s->on_start) s->on_start();
     free(s->out); free(s->seen); free(s->work); free(s);
 }
 API void mono_unity_liveness_calculation_from_root(void* root, Liveness* s)
@@ -728,6 +783,201 @@ API void* mono_custom_attrs_get_attr(NrAttrInfo* i, NrClass* k)
     return 0;
 }
 API void mono_custom_attrs_free(NrAttrInfo* i) { TR("mono_custom_attrs_free"); free(i); }
+
+
+/* ==== Unity 2017-2019 (mono-2.0-bdwgc.dll) ====
+ * The exports a 2018.4 UnityPlayer.dll resolves on top of Unity 4's set.
+ * Unity reads class userdata through mono_class_get_userdata_offset, and
+ * string/array payloads at mono's 64-bit offsets (NrString/NrArray match). */
+
+API int mono_class_get_userdata_offset(void) { TR("mono_class_get_userdata_offset"); return (int)offsetof(NrClass, unity_userdata); }
+API void* mono_class_get_userdata(NrClass* k) { TR("mono_class_get_userdata"); return k->unity_userdata; }
+API void mono_class_set_userdata(NrClass* k, void* d) { TR("mono_class_set_userdata"); k->unity_userdata = d; }
+API NrClass* mono_unity_class_get(NrImage* img, uint32_t token) { TR("mono_unity_class_get"); return mono_class_get(img, token); }
+API uint32_t mono_class_get_type_token(NrClass* k) { TR("mono_class_get_type_token"); return k->token; }
+API NrClass* mono_class_get_nested_types(NrClass* k, void** iter)
+{
+    TR("mono_class_get_nested_types");
+    for (uintptr_t i = (uintptr_t)*iter; i < (uintptr_t)nr_n_classes; i++)
+        if (nr_classes[i]->nested_in == k) { *iter = (void*)(i + 1); return nr_classes[i]; }
+    *iter = (void*)(uintptr_t)nr_n_classes;
+    return 0;
+}
+static int blittable(NrClass* k)
+{
+    if (!(k->flags & NR_VALUETYPE)) return 0;
+    if (k->byval_arg.type == 2 || k->byval_arg.type == 3) return 0;   /* bool, char */
+    for (int i = 0; i < k->n_fields; i++)
+    {
+        const NrFieldDesc* f = &k->fields[i];
+        if ((f->flags & 0x10) || f->offset < 0) continue;
+        if (nr_is_ref(f->type) || (f->type != k && !blittable(f->type))) return 0;
+    }
+    return 1;
+}
+API gboolean mono_class_is_blittable(NrClass* k) { TR("mono_class_is_blittable"); return blittable(k); }
+API NrClass* mono_field_get_parent(const NrFieldDesc* f) { TR("mono_field_get_parent"); return f->parent; }
+API int mono_array_element_size(NrClass* ak) { TR("mono_array_element_size"); return ak->elem_size; }
+API char* mono_array_addr_with_size(NrArray* a, int size, uintptr_t idx) { TR("mono_array_addr_with_size"); return (char*)a->vector + (size_t)size * idx; }
+API void* mono_unity_array_new_2d(NrDomain* d, NrClass* e, uintptr_t n0, uintptr_t n1)
+{
+    TR("mono_unity_array_new_2d"); (void)d;
+    int32_t l[2] = { (int32_t)n0, (int32_t)n1 };
+    return nr_new_mdarray(nr_array_class(e, 2), 2, l);
+}
+API void* mono_unity_array_new_3d(NrDomain* d, NrClass* e, uintptr_t n0, uintptr_t n1, uintptr_t n2)
+{
+    TR("mono_unity_array_new_3d"); (void)d;
+    int32_t l[3] = { (int32_t)n0, (int32_t)n1, (int32_t)n2 };
+    return nr_new_mdarray(nr_array_class(e, 3), 3, l);
+}
+API void* mono_object_isinst(void* o, NrClass* k) { TR("mono_object_isinst"); return nr_isinst(o, k); }
+API void mono_gc_wbarrier_set_field(void* obj, void** field, void* v) { (void)obj; *field = v; }
+API void mono_gc_wbarrier_generic_store(void** p, void* v) { *p = v; }
+static int gc_disabled;
+API void mono_unity_gc_disable(void) { TR("mono_unity_gc_disable"); if (!gc_disabled++) GC_disable(); }
+API void mono_unity_gc_enable(void) { TR("mono_unity_gc_enable"); if (gc_disabled && !--gc_disabled) GC_enable(); }
+API gboolean mono_unity_gc_is_disabled(void) { TR("mono_unity_gc_is_disabled"); return gc_disabled != 0; }
+API void mono_unity_g_free(void* p) { TR("mono_unity_g_free"); free(p); }
+API void* mono_unity_string_empty_wrapper(void) { TR("mono_unity_string_empty_wrapper"); return nr_str_alloc(0); }
+API char* mono_string_to_utf8_checked(void* s, void* err) { TR("mono_string_to_utf8_checked"); if (err) memset(err, 0, 8); return nr_utf8(s); }
+API gboolean mono_type_is_byref(NrType* t) { TR("mono_type_is_byref"); return NR_TYPE_BYREF(t); }
+API uint32_t mono_type_get_attrs(NrType* t) { TR("mono_type_get_attrs"); return t->attrs; }
+API char* mono_type_get_name_full(NrType* t, int format) { TR("mono_type_get_name_full"); (void)format; return mono_type_get_name(t); }
+API gboolean mono_metadata_type_equal(NrType* a, NrType* b) { TR("mono_metadata_type_equal"); return a->klass == b->klass && NR_TYPE_BYREF(a) == NR_TYPE_BYREF(b); }
+API char* mono_method_full_name(const NrMethodDesc* m, gboolean sig)
+{
+    TR("mono_method_full_name"); (void)sig;
+    size_t n = strlen(m->klass->ns) + strlen(m->klass->name) + strlen(m->name) + 4;
+    char* s = (char*)malloc(n);
+    snprintf(s, n, "%s%s%s:%s", m->klass->ns, *m->klass->ns ? "." : "", m->klass->name, m->name);
+    return s;
+}
+API NrImage* mono_image_loaded(const char* name)
+{
+    TR("mono_image_loaded");
+    for (int i = 0; i < nr_n_images; i++) if (!_stricmp(nr_images[i]->name, name)) return nr_images[i];
+    return 0;
+}
+API void mono_assembly_name_free(const char** aname) { TR("mono_assembly_name_free"); if (aname && *aname) { free((void*)*aname); *aname = 0; } }
+API void mono_set_assemblies_path_null_separated(const char* p) { TR("mono_set_assemblies_path_null_separated"); (void)p; }
+API void mono_unity_set_data_dir(const char* d) { TR("mono_unity_set_data_dir"); (void)d; }
+API void mono_unity_set_vprintf_func(void* fn) { TR("mono_unity_set_vprintf_func"); (void)fn; }
+API void mono_unity_install_unitytls_interface(void* t) { TR("mono_unity_install_unitytls_interface"); (void)t; }
+API void mono_unity_domain_set_config(NrDomain* d, const char* base, const char* cfg) { TR("mono_unity_domain_set_config"); (void)d; (void)base; (void)cfg; }
+API void mono_unity_runtime_set_main_args(int argc, const char** argv) { TR("mono_unity_runtime_set_main_args"); (void)argc; (void)argv; }
+API void mono_unity_jit_cleanup(NrDomain* d) { TR("mono_unity_jit_cleanup"); (void)d; }
+API void* mono_unity_capture_memory_snapshot(void) { TR("mono_unity_capture_memory_snapshot"); return 0; }
+API void mono_unity_free_captured_memory_snapshot(void* s) { TR("mono_unity_free_captured_memory_snapshot"); (void)s; }
+API void mono_unity_lock_dynamic_function_access_tables64(void) {}
+API void mono_unity_unlock_dynamic_function_access_tables64(void) {}
+API gboolean mono_is_debugger_attached(void) { TR("mono_is_debugger_attached"); return 0; }
+API void* mono_jit_info_table_find(NrDomain* d, void* addr) { (void)d; (void)addr; return 0; }
+API void* mono_jit_info_get_code_start(void* ji) { (void)ji; return 0; }
+API int mono_jit_info_get_code_size(void* ji) { (void)ji; return 0; }
+API void* mono_debug_lookup_source_location(void* addr, uint32_t off, NrDomain* d) { (void)addr; (void)off; (void)d; return 0; }
+API void mono_debug_free_source_location(void* l) { (void)l; }
+/* profiler: accepted, never called back */
+static int profiler_handle;
+API void* mono_profiler_create(void* p) { TR("mono_profiler_create"); (void)p; return &profiler_handle; }
+API void mono_profiler_install(void* p, void* shutdown) { TR("mono_profiler_install"); (void)p; (void)shutdown; }
+API void mono_profiler_install_gc(void* a, void* b) { TR("mono_profiler_install_gc"); (void)a; (void)b; }
+API void mono_profiler_load(const char* d) { TR("mono_profiler_load"); (void)d; }
+API void mono_profiler_set_events(int e) { TR("mono_profiler_set_events"); (void)e; }
+
+/* MonoError: { unsigned short error_code; ... } kept clear */
+API void mono_error_init(void* e) { if (e) memset(e, 0, 8); }
+API void mono_error_cleanup(void* e) { (void)e; }
+API gboolean mono_error_ok(void* e) { return !e || *(uint16_t*)e == 0; }
+API unsigned short mono_error_get_error_code(void* e) { return e ? *(uint16_t*)e : 0; }
+API const char* mono_error_get_message(void* e) { (void)e; return 0; }
+API void* mono_unity_error_convert_to_exception(void* e) { (void)e; return 0; }
+API void* mono_unity_loader_get_last_error_and_error_prepare_exception(void) { return 0; }
+
+API void* mono_get_exception_argument_null(const char* arg) { TR("mono_get_exception_argument_null"); return nr_exception(nr_class_by_name("System", "ArgumentNullException"), arg); }
+API void* mono_exception_from_name_two_strings(NrImage* img, const char* ns, const char* name, void* a1, void* a2)
+{
+    TR("mono_exception_from_name_two_strings");
+    NrClass* k = nr_class_in_image(img, ns, name);
+    if (!k) k = nr_class_by_name(ns, name);
+    if (!k) k = nr_k_exception;
+    void* e = nr_new(k);
+    for (int i = 0; i < k->n_methods; i++)
+        if (!strcmp(k->methods[i].name, ".ctor") && k->methods[i].n_params == 2 && k->methods[i].fn
+            && k->methods[i].params[0] == nr_k_string && k->methods[i].params[1] == nr_k_string)
+        { ((void (*)(void*, void*, void*))k->methods[i].fn)(e, a1, a2); return e; }
+    return e;
+}
+API void* mono_runtime_invoke_array(const NrMethodDesc* m, void* obj, NrArray* params, void** exc)
+{
+    TR("mono_runtime_invoke_array");
+    void* argv[32];
+    int n = params ? (int)params->max_length : 0;
+    for (int i = 0; i < n && i < 32; i++)
+    {
+        void* a = ((void**)params->vector)[i];
+        NrClass* pt = m->params ? m->params[i] : 0;
+        argv[i] = pt && !nr_is_ref(pt) && a ? (char*)a + sizeof(NrObj) : a;
+    }
+    return nr_invoke(m, obj, argv, exc);
+}
+
+static NrAttrInfo* attr_info(const NrAttr* a, int n);
+API NrAttrInfo* mono_custom_attrs_from_assembly(NrImage* a) { TR("mono_custom_attrs_from_assembly"); (void)a; return 0; }
+API NrAttrInfo* mono_custom_attrs_from_property(NrClass* k, const NrProp* p) { TR("mono_custom_attrs_from_property"); (void)k; (void)p; return 0; }
+API void* mono_custom_attrs_construct(NrAttrInfo* i)
+{
+    TR("mono_custom_attrs_construct");
+    void* a = nr_newarr(nr_k_objarr, i ? i->n : 0);
+    for (int j = 0; i && j < i->n; j++) ((void**)((NrArray*)a)->vector)[j] = i->a[j].make();
+    return a;
+}
+API void* mono_custom_attrs_get_attrs(NrAttrInfo* i, void** iter)
+{
+    TR("mono_custom_attrs_get_attrs");
+    uintptr_t j = (uintptr_t)*iter;
+    if (!i || (int)j >= i->n) return 0;
+    *iter = (void*)(j + 1);
+    return i->a[j].make();
+}
+void nr_attrs_of(void* provider, const NrAttr** a, int* n);
+API void* mono_reflection_get_custom_attrs_by_type(void* obj, NrClass* k, void* err)
+{
+    TR("mono_reflection_get_custom_attrs_by_type");
+    if (err) memset(err, 0, 8);
+    const NrAttr* a; int n;
+    nr_attrs_of(obj, &a, &n);
+    int c = 0;
+    for (int i = 0; i < n; i++) if (!k || nr_assignable(k, a[i].klass)) c++;
+    void* arr = nr_newarr(nr_k_objarr, c);
+    int j = 0;
+    for (int i = 0; i < n; i++) if (!k || nr_assignable(k, a[i].klass)) ((void**)((NrArray*)arr)->vector)[j++] = a[i].make();
+    return arr;
+}
+API void* mono_custom_attrs_construct_by_type(NrAttrInfo* i, NrClass* k)
+{
+    TR("mono_custom_attrs_construct_by_type");
+    int c = 0;
+    for (int j = 0; i && j < i->n; j++) if (!k || nr_assignable(k, i->a[j].klass)) c++;
+    void* arr = nr_newarr(nr_k_objarr, c);
+    int q = 0;
+    for (int j = 0; i && j < i->n; j++) if (!k || nr_assignable(k, i->a[j].klass)) ((void**)((NrArray*)arr)->vector)[q++] = i->a[j].make();
+    return arr;
+}
+
+API gboolean mono_method_is_generic(const NrMethodDesc* m) { TR("mono_method_is_generic"); (void)m; return 0; }
+API gboolean mono_method_is_inflated(const NrMethodDesc* m) { TR("mono_method_is_inflated"); (void)m; return 0; }
+API const NrMethodDesc* mono_reflection_method_get_method(void* mobj)
+{
+    TR("mono_reflection_method_get_method");
+    const NrFieldDesc* f = mobj ? nr_field(((NrObj*)mobj)->klass, "mhandle") : 0;
+    return f ? *(const NrMethodDesc**)((char*)mobj + f->offset) : 0;
+}
+API void* g_malloc(size_t n) { return malloc(n); }
+/* Unity 2018 resolves these three under a unity_ prefix */
+API gboolean unity_mono_method_is_generic(const NrMethodDesc* m) { return mono_method_is_generic(m); }
+API gboolean unity_mono_method_is_inflated(const NrMethodDesc* m) { return mono_method_is_inflated(m); }
+API const NrMethodDesc* unity_mono_reflection_method_get_method(void* mobj) { return mono_reflection_method_get_method(mobj); }
 
 /* called by the runtime for exceptions nothing caught on a thread */
 void nr_report_unhandled(void* exc)

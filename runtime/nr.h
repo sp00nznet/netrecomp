@@ -23,12 +23,28 @@ typedef struct NrObj { NrClass* klass; void* sync; } NrObj;
 typedef struct NrString { NrObj o; int32_t length; uint16_t chars[1]; } NrString;
 typedef struct NrBounds { uint32_t length; int32_t lower_bound; } NrBounds;
 typedef struct NrArray { NrObj o; NrBounds* bounds; uint32_t max_length; double vector[1]; } NrArray;
+#if __has_include("nrcfg.h")
+#include "nrcfg.h"          /* generated: NR_CORLIB4 */
+#endif
+#ifndef NR_CORLIB4
+#define NR_CORLIB4 0
+#endif
+#if NR_CORLIB4
+/* mono 4.x profile (Unity 2017+): combined delegates keep their parts in `delegates` */
+typedef struct NrDelegate {
+    NrObj o;
+    void* method_ptr; void* invoke_impl; void* target; void* method;
+    void* delegate_trampoline; void* extra_arg; void* method_code; void* method_info; void* original_method_info; void* data;
+    uint8_t method_is_virtual; void* delegates;
+} NrDelegate;
+#else
 typedef struct NrDelegate {
     NrObj o;
     void* method_ptr; void* invoke_impl; void* target; void* method;
     void* delegate_trampoline; void* method_code; void* method_info; void* original_method_info; void* data;
     void* prev; void* kpm_next;
 } NrDelegate;
+#endif
 
 /* MonoType, laid out as mono's (Unity reads it directly): data is the class
  * for classes and value types, the element class for T[], a MonoArrayType for
@@ -97,6 +113,7 @@ struct NrClass {
     void* rt;                 /* runtime-private */
     const NrAttr* cattrs; uint16_t n_cattrs;
     const struct NrRevPool* rev_pool;   /* delegates handed to native code */
+    void* unity_userdata;     /* Unity 2017+: mono_class_get_userdata_offset points here */
 };
 
 typedef struct NrRevPool { uint32_t* handles; void* const* fns; int32_t n; } NrRevPool;
@@ -165,9 +182,9 @@ void* nr_caught(int32_t* which);   /* in a handler: what its filter (with null o
 #define NR_VT(o) (((NrObj*)(o))->klass->vtable)
 #define NR_NULLCHK(o) do { if (!(o)) nr_throw_null(); } while (0)
 #define NR_ADATA(a) ((void*)((NrArray*)(a))->vector)
-#define NR_AIDX(a, i) nr_aidx((NrArray*)(a), (int32_t)(i))
+#define NR_AIDX(a, i) nr_aidx((NrArray*)(a), (intptr_t)(i))
 
-static __inline int32_t nr_aidx(NrArray* a, int32_t i) { if ((uint32_t)i >= a->max_length) nr_throw_range(); return i; }
+static __inline intptr_t nr_aidx(NrArray* a, intptr_t i) { if ((uintptr_t)i >= (uintptr_t)a->max_length) nr_throw_range(); return i; }
 static __inline void* nr_zalloca(void* p, uint32_t n) { memset(p, 0, n); return p; }
 static __inline float nr_f32(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
 static __inline double nr_f64(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }
@@ -225,8 +242,10 @@ NR_OVF(i2, int32_t, -32768, 32767)
 NR_OVF(u2, int32_t, 0, 65535)
 NR_OVF(i4, int32_t, INT32_MIN, INT32_MAX)
 NR_OVF(u4, int32_t, 0, UINT32_MAX)
+#ifndef _WIN64
 NR_OVF(i, int32_t, INT32_MIN, INT32_MAX)
 NR_OVF(u, int32_t, 0, UINT32_MAX)
+#endif
 NR_OVF(i8, int64_t, INT64_MIN, INT64_MAX)
 #undef NR_OVF
 static __inline int64_t nr_ovf_u8_i4(int32_t v) { if (v < 0) nr_throw_overflow(); return v; }
@@ -235,6 +254,35 @@ static __inline int64_t nr_ovf_u8_r8(double v) { if (!(v > -1.0 && v < 184467440
 static __inline int64_t nr_ovf_u8_un_i4(int32_t v) { return (int64_t)(uint32_t)v; }
 static __inline int64_t nr_ovf_u8_un_i8(int64_t v) { return v; }
 static __inline int64_t nr_ovf_u8_un_r8(double v) { return nr_ovf_u8_r8(v); }
+#ifdef _WIN64
+/* native int is 64-bit: conv.ovf.i/u are the 8-byte forms */
+#define nr_ovf_i_i4 nr_ovf_i8_i4
+#define nr_ovf_i_i8 nr_ovf_i8_i8
+#define nr_ovf_i_r8 nr_ovf_i8_r8
+#define nr_ovf_i_un_i4 nr_ovf_i8_un_i4
+#define nr_ovf_i_un_i8 nr_ovf_i8_un_i8
+#define nr_ovf_i_un_r8 nr_ovf_i8_un_r8
+#define nr_ovf_u_i4 nr_ovf_u8_i4
+#define nr_ovf_u_i8 nr_ovf_u8_i8
+#define nr_ovf_u_r8 nr_ovf_u8_r8
+#define nr_ovf_u_un_i4 nr_ovf_u8_un_i4
+#define nr_ovf_u_un_i8 nr_ovf_u8_un_i8
+#define nr_ovf_u_un_r8 nr_ovf_u8_un_r8
+#define NR_NI(x) x##_i8
+#else
+#define NR_NI(x) x##_i4
+#endif
+/* native-int arithmetic (Emit's "_i" suffix) */
+#define nr_div_i(a, b) ((intptr_t)NR_NI(nr_div)(a, b))
+#define nr_rem_i(a, b) ((intptr_t)NR_NI(nr_rem)(a, b))
+#define nr_divu_i(a, b) ((intptr_t)NR_NI(nr_divu)(a, b))
+#define nr_remu_i(a, b) ((intptr_t)NR_NI(nr_remu)(a, b))
+#define nr_add_ovf_i(a, b) ((intptr_t)NR_NI(nr_add_ovf)(a, b))
+#define nr_sub_ovf_i(a, b) ((intptr_t)NR_NI(nr_sub_ovf)(a, b))
+#define nr_mul_ovf_i(a, b) ((intptr_t)NR_NI(nr_mul_ovf)(a, b))
+#define nr_addu_ovf_i(a, b) ((intptr_t)NR_NI(nr_addu_ovf)(a, b))
+#define nr_subu_ovf_i(a, b) ((intptr_t)NR_NI(nr_subu_ovf)(a, b))
+#define nr_mulu_ovf_i(a, b) ((intptr_t)NR_NI(nr_mulu_ovf)(a, b))
 
 #ifdef __cplusplus
 }

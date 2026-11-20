@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--corlib", default=os.environ.get("NR_CORLIB"))
     ap.add_argument("--work", default=os.path.join(ROOT, "scratch", "conformance"))
     ap.add_argument("--only")
+    ap.add_argument("--arch", choices=["x86", "x64"], default="x86")
     ap.add_argument("--update-baseline", action="store_true")
     a = ap.parse_args()
 
@@ -61,7 +62,7 @@ def main():
         if r.returncode:
             results[name] = "FAIL (lift)"; print(f"FAIL {name}: lift\n{(r.stdout + r.stderr)[-2000:]}"); continue
         out = os.path.join(d, "bin", name + ".exe")
-        r = run([sys.executable, os.path.join(HERE, "build.py"), "--gen", gen, "--out", out, "--exe", "--opt=-O1"])
+        r = run([sys.executable, os.path.join(HERE, "build.py"), "--gen", gen, "--out", out, "--exe", "--opt=-O1", "--arch", a.arch])
         if r.returncode:
             results[name] = "FAIL (build)"; print(f"FAIL {name}: build\n{r.stdout[-2000:]}"); continue
         try:
@@ -80,7 +81,7 @@ def main():
             if got.stderr:
                 print("  " + got.stderr.strip().splitlines()[-1])
     print(f"conformance: {passed}/{len(tests)} passed")
-    base_file = os.path.join(ROOT, "conformance", "baseline.json")
+    base_file = os.path.join(ROOT, "conformance", "baseline.json" if a.arch == "x86" else f"baseline-{a.arch}.json")
     base = json.load(open(base_file)) if os.path.exists(base_file) else {"passed": 0}
     if a.update_baseline:
         json.dump({"passed": passed, "total": len(tests), "results": results}, open(base_file, "w"), indent=2)

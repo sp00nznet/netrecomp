@@ -59,12 +59,12 @@ sealed class MethodEmitter
     // ---- stack ----
     static string Suffix(SV v, Layouts lay) => v.K switch
     {
-        SK.I4 => "i", SK.I => "i", SK.I8 => "l", SK.R4 => "f", SK.R8 => "d", SK.P => "p",
+        SK.I4 => "i", SK.I => "n", SK.I8 => "l", SK.R4 => "f", SK.R8 => "d", SK.P => "p",
         _ => "v" + lay.Id(v.T!),
     };
     string CTypeOf(SV v) => v.K switch
     {
-        SK.I4 or SK.I => "int32_t", SK.I8 => "int64_t", SK.R4 => "float", SK.R8 => "double", SK.P => "void*",
+        SK.I4 => "int32_t", SK.I => "intptr_t", SK.I8 => "int64_t", SK.R4 => "float", SK.R8 => "double", SK.P => "void*",
         _ => lay.C(v.T!),
     };
     string Var(int depth, SV v)
@@ -210,7 +210,7 @@ sealed class MethodEmitter
         if (hasFinally) o.Append($"ex{fin[0].HandlerStart.Offset} = 0;\n");
         o.Append("__try {\n");
         EmitRange(b.TryStart, b.TryEnd, inner);
-        if (hasFinally) o.Append($"X{b.TryStart:x4}:;\n");
+        if (hasFinally) o.Append($"X{b.TryStart:x4}_{b.TryEnd:x4}:;\n");
         o.Append("}\n");
         if (hasFinally)
         {
@@ -222,13 +222,13 @@ sealed class MethodEmitter
             var ev = $"ex{h.HandlerStart.Offset}";
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n}}\n");
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, open);
+            EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, open);
             o.Append($"{finEnd[h]}:;\n    if ({ev}) nr_throw({ev});\n");
             if (leaves.TryGetValue(b, out var exits))
             {
                 var (so, sf) = (curOpen, curOff);
                 (curOpen, curOff) = (open, b.TryStart);
-                o.Append($"switch (lv{b.TryStart:x4}) {{\n");
+                o.Append($"switch (lv{b.TryStart:x4}_{b.TryEnd:x4}) {{\n");
                 for (int k = 0; k < exits.Count; k++) { o.Append($"case {k}:\n"); sp = 0; Goto(exits[k]); }
                 o.Append("}\n");
                 (curOpen, curOff) = (so, sf);
@@ -242,7 +242,7 @@ sealed class MethodEmitter
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n");
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             excVar.Push(ev);
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
+            EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, inner);
             excVar.Pop();
             o.Append($"{finEnd[h]}:;\n    nr_throw({ev});\n}}\n");
         }
@@ -263,7 +263,7 @@ sealed class MethodEmitter
                 // The handler's IL starts with the exception on the stack.
                 st = new[] { new SV(SK.P, null) }; sp = 1;
                 o.Append($"    s0p = {hv};\n"); vars["s0p"] = "void*";
-                EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
+                EmitRange(h.HandlerStart.Offset, h.HandlerEnd?.Offset ?? int.MaxValue, inner);
                 excVar.Pop();
             }
             o.Append("}\n}\n");
@@ -316,7 +316,7 @@ sealed class MethodEmitter
             case Code.Neg:
             {
                 var a = Pop();
-                Push(a.v, a.v.K switch { SK.I4 or SK.I => $"(int32_t)(0u - (uint32_t){a.n})", SK.I8 => $"(int64_t)(0ull - (uint64_t){a.n})", _ => $"-{a.n}" });
+                Push(a.v, a.v.K switch { SK.I4 => $"(int32_t)(0u - (uint32_t){a.n})", SK.I => $"(intptr_t)((uintptr_t)0 - (uintptr_t){a.n})", SK.I8 => $"(int64_t)(0ull - (uint64_t){a.n})", _ => $"-{a.n}" });
                 break;
             }
             case Code.Not: { var a = Pop(); Push(a.v, $"~{a.n}"); break; }
@@ -424,7 +424,7 @@ sealed class MethodEmitter
             case Code.Sizeof: { var t = Ty(ins); Push(new SV(SK.I4, null), $"(int32_t)sizeof({lay.C(t)})"); break; }
             case Code.Cpblk: { var n = Pop(); var s = Pop(); var d = Pop(); L($"memmove((void*){d.n}, (void*){s.n}, (uint32_t){n.n});"); break; }
             case Code.Initblk: { var n = Pop(); var v = Pop(); var d = Pop(); L($"memset((void*){d.n}, {v.n}, (uint32_t){n.n});"); break; }
-            case Code.Localloc: { var n = Pop(); Push(new SV(SK.I, null), $"(int32_t)(intptr_t)nr_zalloca(_alloca((uint32_t){n.n}), (uint32_t){n.n})"); break; }
+            case Code.Localloc: { var n = Pop(); Push(new SV(SK.I, null), $"(intptr_t)nr_zalloca(_alloca((uint32_t){n.n}), (uint32_t){n.n})"); break; }
 
             case Code.Ldfld: case Code.Ldflda: case Code.Stfld: Field(code, (FieldReference)ins.Operand); break;
             case Code.Ldsfld: case Code.Ldsflda: case Code.Stsfld: StaticField(code, (FieldReference)ins.Operand); break;
@@ -435,13 +435,13 @@ sealed class MethodEmitter
             case Code.Ldftn:
             {
                 var t = Meth(ins);
-                Push(new SV(SK.I, null), $"(int32_t)(intptr_t){g.FnPtr(t)}");
+                Push(new SV(SK.I, null), $"(intptr_t){g.FnPtr(t)}");
                 break;
             }
             case Code.Ldvirtftn:
             {
                 var t = Meth(ins); var obj = Pop();
-                Push(new SV(SK.I, null), $"(int32_t)(intptr_t){VirtualFn(t, obj.n)}");
+                Push(new SV(SK.I, null), $"(intptr_t){VirtualFn(t, obj.n)}");
                 break;
             }
 
@@ -459,7 +459,7 @@ sealed class MethodEmitter
                 Push(new SV(SK.P, at), $"nr_newarr(&{g.Klass(at)}, {n.n})");
                 break;
             }
-            case Code.Ldlen: { var a = Pop(); Push(new SV(SK.I, null), $"(int32_t)((NrArray*){a.n})->max_length"); break; }
+            case Code.Ldlen: { var a = Pop(); Push(new SV(SK.I, null), $"(intptr_t)((NrArray*){a.n})->max_length"); break; }
             case Code.Ldelem_I1: LdElem("int8_t", SK.I4); break;
             case Code.Ldelem_U1: LdElem("uint8_t", SK.I4); break;
             case Code.Ldelem_I2: LdElem("int16_t", SK.I4); break;
@@ -516,8 +516,8 @@ sealed class MethodEmitter
         if (!leaves.TryGetValue(b, out var exits)) leaves[b] = exits = new();
         int id = exits.IndexOf(t);
         if (id < 0) { exits.Add(t); id = exits.Count - 1; }
-        vars[$"lv{b.TryStart:x4}"] = "int32_t";
-        L($"lv{b.TryStart:x4} = {id}; goto X{b.TryStart:x4};");
+        vars[$"lv{b.TryStart:x4}_{b.TryEnd:x4}"] = "int32_t";
+        L($"lv{b.TryStart:x4}_{b.TryEnd:x4} = {id}; goto X{b.TryStart:x4}_{b.TryEnd:x4};");
     }
 
     // Joins where paths push different kinds of the same width (a fixed
@@ -525,7 +525,7 @@ sealed class MethodEmitter
     // edge into such a join converts into the join's variables.
     SV Merge(SV a, SV b, int at)
     {
-        if (Suffix(a, lay) == Suffix(b, lay)) return a.K == SK.I4 && b.K == SK.I ? b : a;
+        if (Suffix(a, lay) == Suffix(b, lay)) return a;
         if (a.K is SK.I4 or SK.I or SK.P && b.K is SK.I4 or SK.I or SK.P) return new SV(SK.I, null);
         throw new EmitError($"stack type mismatch at IL_{at:x4}: {a.K} vs {b.K}");
     }
@@ -587,6 +587,7 @@ sealed class MethodEmitter
         {
             var w8 = rk == SK.I8;
             var s = w8 ? "int64_t" : "int32_t"; var u = w8 ? "uint64_t" : "uint32_t"; var sfx = w8 ? "i8" : "i4";
+            if (rk is SK.I or SK.P) { s = "intptr_t"; u = "uintptr_t"; sfx = "i"; }
             e = code switch
             {
                 Code.Add => $"({s})(({u}){x} + ({u}){y})",
@@ -609,8 +610,9 @@ sealed class MethodEmitter
     {
         var b = Pop(); var a = Pop();
         var w8 = a.v.K == SK.I8;
-        var mask = w8 ? 63 : 31;
+        var mask = w8 ? "63" : "31";
         var s = w8 ? "int64_t" : "int32_t"; var u = w8 ? "uint64_t" : "uint32_t";
+        if (a.v.K is SK.I or SK.P) { mask = "(int32_t)(sizeof(intptr_t) * 8 - 1)"; s = "intptr_t"; u = "uintptr_t"; }
         var e = code switch
         {
             Code.Shl => $"({s})(({u}){a.n} << ({b.n} & {mask}))",
@@ -677,12 +679,12 @@ sealed class MethodEmitter
             case Code.Conv_U2: Push(new SV(SK.I4, null), f ? $"(uint16_t)nr_d2i4({n})" : $"(uint16_t){n}"); break;
             case Code.Conv_U4: Push(new SV(SK.I4, null), f ? $"(int32_t)(uint32_t)nr_d2i8({n})" : $"(int32_t)(uint32_t){n}"); break;
             case Code.Conv_I8: Push(new SV(SK.I8, null), f ? $"nr_d2i8({n})" : $"(int64_t){n}"); break;
-            case Code.Conv_U8: Push(new SV(SK.I8, null), f ? $"(int64_t)nr_d2u8({n})" : k == SK.I8 ? n : $"(int64_t)(uint32_t){n}"); break;
-            case Code.Conv_I: Push(new SV(SK.I, null), f ? $"nr_d2i4({n})" : $"(int32_t){n}"); break;
-            case Code.Conv_U: Push(new SV(SK.I, null), f ? $"(int32_t)(uint32_t)nr_d2i8({n})" : $"(int32_t)(uint32_t){n}"); break;
+            case Code.Conv_U8: Push(new SV(SK.I8, null), f ? $"(int64_t)nr_d2u8({n})" : k == SK.I8 ? n : k is SK.I or SK.P ? $"(int64_t)(uintptr_t){n}" : $"(int64_t)(uint32_t){n}"); break;
+            case Code.Conv_I: Push(new SV(SK.I, null), f ? $"(intptr_t)nr_d2i8({n})" : $"(intptr_t){n}"); break;
+            case Code.Conv_U: Push(new SV(SK.I, null), f ? $"(intptr_t)(uintptr_t)nr_d2u8({n})" : k == SK.I4 ? $"(intptr_t)(uint32_t){n}" : $"(intptr_t)(uintptr_t){n}"); break;
             case Code.Conv_R4: Push(new SV(SK.R4, null), $"(float){n}"); break;
             case Code.Conv_R8: Push(new SV(SK.R8, null), $"(double){n}"); break;
-            case Code.Conv_R_Un: Push(new SV(SK.R8, null), k == SK.I8 ? $"(double)(uint64_t){n}" : f ? $"(double){n}" : $"(double)(uint32_t){n}"); break;
+            case Code.Conv_R_Un: Push(new SV(SK.R8, null), k == SK.I8 ? $"(double)(uint64_t){n}" : f ? $"(double){n}" : k == SK.I4 ? $"(double)(uint32_t){n}" : $"(double)(uintptr_t){n}"); break;
         }
     }
 
@@ -693,9 +695,9 @@ sealed class MethodEmitter
         var parts = name.Split('.');
         var to = parts[2];
         var un = parts.Length > 3 ? "_un" : "";
-        var from = a.v.K switch { SK.I8 => "i8", SK.R4 or SK.R8 => "r8", _ => "i4" };
+        var from = a.v.K switch { SK.I8 or SK.I or SK.P => "i8", SK.R4 or SK.R8 => "r8", _ => "i4" };
         var rk = to is "i8" or "u8" ? SK.I8 : to is "i" or "u" ? SK.I : SK.I4;
-        var arg = a.v.K == SK.P ? $"(intptr_t){a.n}" : a.n;
+        var arg = a.v.K is SK.I or SK.P ? (un.Length > 0 ? $"(int64_t)(uintptr_t){a.n}" : $"(int64_t)(intptr_t){a.n}") : a.n;
         Push(new SV(rk, null), $"nr_ovf_{to}{un}_{from}({arg})");
     }
 
@@ -759,7 +761,7 @@ sealed class MethodEmitter
         if (code == Code.Stsfld) val = Pop();
         if (popObj) Pop();
         if (g.NeedsCctorCheck(f.Owner, m)) L($"NR_CCTOR({g.Cctor(f.Owner)});");
-        if (f.Def.HasFieldRVA && code == Code.Ldsflda) { Push(new SV(SK.I, null), $"(int32_t)(intptr_t){g.Rva(f)}"); return; }
+        if (f.Def.HasFieldRVA && code == Code.Ldsflda) { Push(new SV(SK.I, null), $"(intptr_t){g.Rva(f)}"); return; }
         var acc = $"{g.Statics(f.Owner)}.{g.FieldC(f)}";
         switch (code)
         {

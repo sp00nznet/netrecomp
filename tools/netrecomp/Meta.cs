@@ -118,7 +118,8 @@ sealed class MetaWriter
         {
             var L = lay.Full(md);
             string F(string n) => L.Inst.First(x => x.f.Def.Name == n).cname;
-            sb.Append($"typedef char nr_check_delegate[(offsetof(O{md.Id}, {F("m_target")}) == offsetof(NrDelegate, target) && offsetof(O{md.Id}, {F("prev")}) == offsetof(NrDelegate, prev)) ? 1 : -1];\n");
+            var last = g.Corlib4 ? "method_info" : "prev";
+            sb.Append($"typedef char nr_check_delegate[(offsetof(O{md.Id}, {F("m_target")}) == offsetof(NrDelegate, target) && offsetof(O{md.Id}, {F(last)}) == offsetof(NrDelegate, {last})) ? 1 : -1];\n");
         }
         return sb.ToString();
     }
@@ -426,7 +427,7 @@ sealed class MetaWriter
         switch (t.K)
         {
             case TK.SzArray: case TK.Array:
-                inst = "16"; vsize = "sizeof(void*)";
+                inst = "(int32_t)offsetof(NrArray, vector)"; vsize = "sizeof(void*)";
                 esize = lay.Kind(t.Elem) == SK.VT ? $"sizeof(T{lay.Id(t.Elem)})" : $"sizeof({lay.C(t.Elem)})";
                 break;
             case TK.Ptr: case TK.FnPtr: case TK.ByRef: inst = "sizeof(NrObj)"; vsize = "sizeof(void*)"; break;
