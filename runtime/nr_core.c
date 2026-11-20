@@ -83,6 +83,7 @@ int32_t nr_value_size(NrClass* k) { return nr_is_ref(k) ? (int32_t)sizeof(void*)
 /* T[] for a class: generated when the program uses it, else built here with
  * System.Array's vtable (no generic IList<T> on such arrays). */
 static CRITICAL_SECTION arr_lock;
+static void borrow_vtable(NrClass* k);
 NrClass* nr_array_class(NrClass* elem, int rank)
 {
     if (rank == 1 && elem->szarray) return elem->szarray;
@@ -113,6 +114,7 @@ NrClass* nr_array_class(NrClass* elem, int rank)
     k->supers = s; k->depth = 2;
     k->byval_arg.klass = k; k->byval_arg.data = elem; k->byval_arg.type = rank == 1 ? 0x1d : 0x14; k->this_arg = k->byval_arg; k->this_arg.bits = 0x40;
     k->type_obj = 0; k->szarray = 0; k->fields = 0; k->n_fields = 0; k->methods = 0; k->n_methods = 0;
+    if (!k->vtable) borrow_vtable(k);   /* System.Array is abstract: Object's methods */
     (void)sup;
     struct DynArr* d = (struct DynArr*)malloc(sizeof *d);
     d->elem = elem; d->rank = rank; d->k = k; d->next = dyn; dyn = d;
@@ -126,9 +128,52 @@ NrClass* nr_array_class(NrClass* elem, int rank)
 static void finalize_cb(void* obj, void* data);
 static int32_t finalize_slot = -1;
 
+/* A class the translator never saw constructed (a value type only reflection boxes, a
+ * type only Activator creates) has no vtable; borrow the nearest ancestor's so the
+ * Object methods (ToString, Equals, GetHashCode) still dispatch.
+ * ponytail: overrides on such a class are not seen; construct it in the lift if one matters. */
+static void borrow_vtable(NrClass* k)
+{
+    /* a generic instance shares its canonical instance's code: vtable and interface map */
+    if (k->flags & NR_GENERIC_INST)
+        for (int i = 0; i < nr_n_classes; i++)
+        {
+            NrClass* c = nr_classes[i];
+            if (c == k || !c->vtable || !(c->flags & NR_GENERIC_INST) || c->n_gargs != k->n_gargs || c->image != k->image
+                || strcmp(c->name, k->name) || strcmp(c->ns, k->ns)) continue;
+            int ok = 1;
+            for (int j = 0; j < k->n_gargs && ok; j++)
+                ok = c->gargs[j] == k->gargs[j] || (nr_is_ref(k->gargs[j]) && nr_is_ref(c->gargs[j]) && nr_assignable(c->gargs[j], k->gargs[j]));
+            if (!ok) continue;
+            k->n_vtable = c->n_vtable; k->vtable = c->vtable;
+            /* keep k's own interface list (casts test it), with the canonical slot offsets */
+            NrIface* m = (NrIface*)malloc(sizeof(NrIface) * (k->n_ifaces + c->n_ifaces + 1));
+            int n = 0;
+            for (int a = 0; a < k->n_ifaces; a++)
+            {
+                m[n] = k->ifaces[a];
+                for (int b = 0; b < c->n_ifaces && m[n].offset < 0; b++)
+                {
+                    NrClass *x = c->ifaces[b].iface, *y = k->ifaces[a].iface;
+                    if (x == y || (x->n_gargs == y->n_gargs && !strcmp(x->name, y->name) && !strcmp(x->ns, y->ns))) m[n].offset = c->ifaces[b].offset;
+                }
+                n++;
+            }
+            for (int b = 0; b < c->n_ifaces; b++) m[n++] = c->ifaces[b];
+            k->ifaces = m; k->n_ifaces = (uint16_t)n;
+            return;
+        }
+    NrClass* p = (k->flags & NR_VALUETYPE) && !(k->flags & NR_ENUM) ? nr_k_valuetype : k->parent;
+    while (p && !p->vtable) p = p->parent;
+    if (!p) return;
+    k->n_vtable = p->n_vtable;
+    k->vtable = p->vtable;
+}
+
 static void* gc_alloc(NrClass* k, size_t size)
 {
     void* o;
+    if (!k->vtable && !(k->flags & (NR_INTERFACE | NR_ARRAY))) borrow_vtable(k);
     if (k->flags & NR_HAS_REFS) o = GC_MALLOC(size);
     else { o = GC_MALLOC_ATOMIC(size); if (o) memset(o, 0, size); }
     if (!o) nr_throw_new("System", "OutOfMemoryException", "Out of memory");
@@ -240,7 +285,24 @@ int nr_assignable(NrClass* to, NrClass* from)
 {
     if (to == from) return 1;
     if (!to || !from) return 0;
-    if (to->flags & NR_INTERFACE) return implements(from, to);
+    if (to->flags & NR_INTERFACE)
+    {
+        if (implements(from, to)) return 1;
+        if (!to->n_gargs) return 0;
+        /* shared generic code casts to I<object> (or I<Base>) what implements I<Derived>
+         * (same ponytail as the class case below) */
+        for (NrClass* c = from; c; c = c->parent)
+            for (int i = 0; i < c->n_ifaces; i++)
+            {
+                NrClass* x = c->ifaces[i].iface;
+                if (x == to || x->n_gargs != to->n_gargs || x->image != to->image || strcmp(x->name, to->name) || strcmp(x->ns, to->ns)) continue;
+                int ok = 1;
+                for (int j = 0; j < to->n_gargs && ok; j++)
+                    ok = x->gargs[j] == to->gargs[j] || (nr_is_ref(x->gargs[j]) && nr_is_ref(to->gargs[j]) && nr_assignable(to->gargs[j], x->gargs[j]));
+                if (ok) return 1;
+            }
+        return 0;
+    }
     if (to->flags & NR_ARRAY)
     {
         if (!(from->flags & NR_ARRAY) || from->rank != to->rank) return 0;
@@ -250,7 +312,22 @@ int nr_assignable(NrClass* to, NrClass* from)
         return underlying(te) == underlying(fe);
     }
     if (to->flags & NR_NULLABLE) return to->n_gargs && to->gargs[0] == from;
-    return from->depth >= to->depth && from->supers && from->supers[to->depth] == to;
+    if (from->depth >= to->depth && from->supers && from->supers[to->depth] == to) return 1;
+    /* shared generic code: a body compiled for C<object> (or C<Base>) casts its receiver,
+     * which may be a C<Derived> the runtime built from data and runs on that body.
+     * ponytail: accepts generic class covariance over reference types, which C# doesn't have */
+    if ((to->flags & NR_GENERIC_INST) && from->supers && from->depth >= to->depth)
+    {
+        NrClass* a = from->supers[to->depth];
+        if (a && (a->flags & NR_GENERIC_INST) && a->n_gargs == to->n_gargs && a->image == to->image
+            && !strcmp(a->name, to->name) && !strcmp(a->ns, to->ns))
+        {
+            for (int j = 0; j < to->n_gargs; j++)
+                if (a->gargs[j] != to->gargs[j] && !(nr_is_ref(a->gargs[j]) && nr_is_ref(to->gargs[j]) && nr_assignable(to->gargs[j], a->gargs[j]))) return 0;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void* nr_isinst(void* o, NrClass* k)
@@ -282,6 +359,36 @@ void* nr_iface(void* o, NrClass* iface, int k)
             void* fn = off >= 0 ? c->vtable[off + k] : 0;
             if (!fn) break;
             return fn;
+        }
+    /* covariance over reference types: T[] (or anything with IEnumerable<Derived>) used
+     * as IEnumerable<Base>, e.g. List<object>.AddRange running for a List<Derived>.
+     * The code is shared, as reference-type instances lay out the same. */
+    if (iface->n_gargs)
+        for (int i = 0; i < c->n_ifaces; i++)
+        {
+            NrClass* x = c->ifaces[i].iface;
+            if (x == iface || x->n_gargs != iface->n_gargs || x->image != iface->image || strcmp(x->name, iface->name) || strcmp(x->ns, iface->ns)) continue;
+            int ok = 1;
+            for (int j = 0; j < x->n_gargs && ok; j++)
+                ok = x->gargs[j] == iface->gargs[j] || (nr_is_ref(x->gargs[j]) && nr_is_ref(iface->gargs[j]) && nr_assignable(iface->gargs[j], x->gargs[j]));
+            int32_t off = c->ifaces[i].offset;
+            if (ok && off >= 0 && c->vtable[off + k]) return c->vtable[off + k];
+        }
+    /* an array the runtime made (reflection, GetCustomAttributes) may carry no generic
+     * interfaces: T[] as IList<U> borrows U[]'s (or object[]'s) shared implementation */
+    if ((c->flags & NR_ARRAY) && c->rank == 1 && iface->n_gargs == 1 && nr_is_ref(c->elem) && nr_is_ref(iface->gargs[0])
+        && nr_assignable(iface->gargs[0], c->elem))
+        for (int pass = 0; pass < 2; pass++)
+        {
+            NrClass* t = nr_array_class(pass ? nr_k_object : iface->gargs[0], 1);
+            if (t == c) continue;
+            for (int i = 0; i < t->n_ifaces; i++)
+            {
+                NrClass* x = t->ifaces[i].iface;
+                if (x->n_gargs != 1 || strcmp(x->name, iface->name) || strcmp(x->ns, iface->ns)) continue;
+                int32_t off = t->ifaces[i].offset;
+                if (off >= 0 && t->vtable[off + k]) return t->vtable[off + k];
+            }
         }
     /* An array class the runtime built (no generic interfaces): a reference
      * array is covariant and laid out alike, so borrow the interface from a

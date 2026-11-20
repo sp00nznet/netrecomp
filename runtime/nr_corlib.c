@@ -1270,8 +1270,24 @@ static void CompareInfo_construct_compareinfo(void* self, void* locale) { (void)
 static void CompareInfo_free_internal_collator(void* self) { (void)self; }
 static void CompareInfo_assign_sortkey(void* self, void* key, void* src, int32_t opts)
 {
-    (void)self; (void)key; (void)src; (void)opts;
-    nr_throw_notsupported("SortKey");
+    /* ordinal key, consistent with internal_compare: UTF-16 big endian, upper-cased
+     * under IgnoreCase (1), so byte order is code-point order */
+    (void)self;
+    NrString* str = (NrString*)src;
+    int n = str ? str->length : 0;
+    void* bytes = nr_newarr(nr_array_class(nr_k_byte, 1), n * 2);
+    uint8_t* b = (uint8_t*)((NrArray*)bytes)->vector;
+    for (int i = 0; i < n; i++)
+    {
+        uint16_t c = str->chars[i];
+        if ((opts & 1) && c >= 'a' && c <= 'z') c -= 32;
+        b[2 * i] = (uint8_t)(c >> 8); b[2 * i + 1] = (uint8_t)c;
+    }
+    NrClass* k = ((NrObj*)key)->klass;
+    const NrFieldDesc* fk = nr_field(k, "key");
+    const NrFieldDesc* fs = nr_field(k, "source");
+    if (fk) *(void**)((char*)key + fk->offset) = bytes;
+    if (fs) *(void**)((char*)key + fs->offset) = src;
 }
 
 /* Char tables come from the generated chartab.c (Unicode data, not mono's). */
@@ -1330,6 +1346,8 @@ static int32_t AppDomain_getDomainID(void* self) { (void)self; return 1; }
 /* ---- registration ---- */
 
 extern void nr_register_reflect_icalls(void);
+extern void nr_register_net_icalls(void);
+extern void nr_register_decimal_icalls(void);
 void nr_register_corlib_icalls2(void);
 #if NR_CORLIB4
 static void nr_register_corlib4_icalls(void);
@@ -1622,6 +1640,8 @@ void nr_register_corlib_icalls(void)
     (void)Path_GetTempPath_len;
     nr_register_icalls(corlib, (int)(sizeof corlib / sizeof corlib[0]));
     nr_register_reflect_icalls();
+    nr_register_net_icalls();
+    nr_register_decimal_icalls();
     nr_register_corlib_icalls2();
 #if NR_CORLIB4
     nr_register_corlib4_icalls();

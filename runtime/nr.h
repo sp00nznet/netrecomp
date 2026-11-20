@@ -83,6 +83,9 @@ typedef struct NrMethodDesc {
     NrClass* ret; NrClass* const* params; const uint8_t* param_byref;
     uint32_t token;
     const NrAttr* cattrs; uint16_t n_cattrs;
+    /* generic methods: an instance has its arguments; a definition has
+     * n_mgargs and no mgargs (it is never called, MakeGenericMethod picks an instance) */
+    NrClass* const* mgargs; uint16_t n_mgargs;
 } NrMethodDesc;
 
 enum {
@@ -148,6 +151,7 @@ void* nr_castclass(void* o, NrClass* k);
 void* nr_isinst(void* o, NrClass* k);
 void* nr_iface(void* o, NrClass* iface, int k);
 void* nr_gvm(void* o, const NrGvm* g);
+void  nr_socket_aio(void* socket_async_result);
 void  nr_stelem_ref(void* a, int32_t i, void* v);
 void* nr_strlit(int i);
 void  nr_run_cctor(NrClass* k);

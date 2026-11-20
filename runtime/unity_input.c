@@ -9,6 +9,7 @@
  *
  *   move X Y        click X Y       down / up      (left button)
  *   rclick X Y      key VK          wait MS
+ *   text STRING     types STRING as WM_CHAR messages (text fields)
  *
  * Append lines while the game runs (echo click 180 353 >> input.txt). */
 #include <windows.h>
@@ -123,6 +124,8 @@ static void run_command(char* line)
         btn_down[v] = 1; PostMessageA(in_hwnd, WM_KEYDOWN, v, 1); Sleep(120);
         btn_down[v] = 0; PostMessageA(in_hwnd, WM_KEYUP, v, 0xC0000001);
     }
+    else if (!strncmp(line, "text ", 5))
+        for (const char* c = line + 5; *c; c++) { PostMessageA(in_hwnd, WM_CHAR, (unsigned char)*c, 1); Sleep(40); }
     else if (sscanf(line, "wait %d", &v) == 1) Sleep(v);
     else if (line[0] && line[0] != '#') { nr_log("netrecomp: input: unknown command '%s'\n", line); return; }
     nr_log("netrecomp: input: %s\n", line);
