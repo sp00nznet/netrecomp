@@ -76,6 +76,8 @@ sealed class MetaWriter
                 if (t.K is TK.SzArray or TK.Array or TK.Ptr or TK.ByRef) Add(t.Elem);
                 foreach (var (i, _) in L.Ifaces) Add(i);
                 foreach (var a in t.Args) Add(a);
+                // GetGenericTypeDefinition (XmlSerializer asks it of every List<T> field)
+                if (t.K == TK.Def && t.IsGenericInst) Add(w.Inst(t.Def, Array.Empty<TT>()));
                 if (t.IsEnum) Add(lay.EnumBase(t));
                 if (t.K == TK.Def && !t.IsOpen)
                     foreach (var f in t.Def.Fields) Add(Strip(w.FieldType(t, f)));
@@ -494,6 +496,7 @@ sealed class MetaWriter
         else if (t.IsEnum) { elem = cast = "&" + K(lay.EnumBase(t)); }
         string gargs = "0";
         if (t.Args.Length > 0) { gargs = $"GA{id}"; sb.Append($"static NrClass* const GA{id}[] = {{ {string.Join(", ", t.Args.Select(a => "&" + K(a)))} }};\n"); }
+        string gdef = t.K == TK.Def && t.IsGenericInst ? KRef(w.Inst(t.Def, Array.Empty<TT>())) : "0";
         string nested = "0";
         if (t.K == TK.Def && t.Def.DeclaringType != null && !t.Def.DeclaringType.HasGenericParameters)
         {
@@ -520,7 +523,7 @@ sealed class MetaWriter
         var tc = TypeCode(t);
         bool statics = t.K == TK.Def && L.Statics.Count > 0;
         var td = TypeData(sb, t);
-        sb.Append($"NrClass K{id} = {{ &K{id}, \"{Gen.CEsc(name)}\", \"{Gen.CEsc(ns)}\", {(w.BaseOf(t) is TT bt && !t.IsInterface ? "&" + K(bt) : "0")}, {elem}, {cast}, {nested}, 0,\n");
+        sb.Append($"NrClass K{id} = {{ &K{id}, \"{Gen.CEsc(name)}\", \"{Gen.CEsc(ns)}\", {(w.BaseOf(t) is TT bt && !t.IsInterface ? "&" + K(bt) : "0")}, {elem}, {cast}, {nested}, {gdef},\n");
         sb.Append($"    {gargs}, {t.Args.Length}, {t.Rank}, {chain.Count - 1}, 0x{flags:x}, 0x{(t.K == TK.Def ? (uint)t.Def.Attributes : 0):x}, {inst}, {vsize}, {esize},\n");
         sb.Append($"    SUP{id}, {(ifs.Count > 0 ? "IF" + id : "0")}, {ifs.Count}, {nvt}, {(nvt > 0 ? "VT" + id : "0")}, {(cctor == "0" ? "0" : "(void(*)(void))" + cctor)}, 0, 0,\n");
         sb.Append($"    {(statics ? "&S" + id : "0")}, {(statics ? $"sizeof(S{id})" : "0")}, {(fl.Count > 0 ? "FL" + id : "0")}, {fl.Count}, {methods.Count}, ML{id}, {img}, 0x{(t.K == TK.Def ? t.Def.MetadataToken.ToUInt32() : 0):x},\n");

@@ -130,7 +130,8 @@ static uint8_t Type_get_IsGenericTypeDefinition(void* self) { NrClass* k = K(sel
 static void* Type_GetGenericTypeDefinition_impl(void* self)
 {
     NrClass* k = K(self);
-    if (!(k->flags & NR_GENERIC_INST)) return 0;
+    if (!(k->flags & NR_GENERIC_INST)) return Type_get_IsGenericTypeDefinition(self) ? self : 0;
+    if (k->gdef) return nr_type_object(k->gdef);
     for (int i = 0; i < nr_n_classes; i++)
     {
         NrClass* c = nr_classes[i];
