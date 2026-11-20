@@ -24,7 +24,7 @@ static class Program
 
     // Any class-library assembly a player ships (System.ServiceModel, Mono.Data.Sqlite, ...) is
     // reached by reachability too: compiling it whole drags in types Unity's profile trimmed.
-    static bool IsFramework(string n) => Framework.Contains(n) || n.StartsWith("System.") || n.StartsWith("Mono.")
+    public static bool IsFramework(string n) => Framework.Contains(n) || n.StartsWith("System.") || n.StartsWith("Mono.")
         || n.StartsWith("Microsoft.") || n == "Accessibility";
 
     // Types the runtime itself constructs or throws.
@@ -114,6 +114,7 @@ static class Program
         var none = Array.Empty<TT>();
         foreach (var t in a.MainModule.GetTypes())
         {
+            if (t.HasGenericParameters && !IsOpenNested(t)) g.RootDataGenerics(t);
             if (t.HasGenericParameters || IsOpenNested(t)) continue;
             var tt = w.Inst(t, none);
             g.Klass(tt);   // a class record even for static classes: Unity enumerates by token

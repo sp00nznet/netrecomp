@@ -130,13 +130,14 @@ static uint8_t Type_get_IsGenericTypeDefinition(void* self) { NrClass* k = K(sel
 static void* Type_GetGenericTypeDefinition_impl(void* self)
 {
     NrClass* k = K(self);
-    if (!(k->flags & NR_GENERIC_INST)) return 0;
+    if (!(k->flags & NR_GENERIC_INST)) return Type_get_IsGenericTypeDefinition(self) ? self : 0;
     for (int i = 0; i < nr_n_classes; i++)
     {
         NrClass* c = nr_classes[i];
         if (c->image == k->image && !(c->flags & NR_GENERIC_INST) && !strcmp(c->name, k->name) && !strcmp(c->ns, k->ns))
             return nr_type_object(c);
     }
+    nr_log("netrecomp: no generic definition record for %s.%s\n", k->ns, k->name);
     return 0;
 }
 static void* Type_MakeGenericType(void* gt, void* types)
@@ -287,7 +288,7 @@ static void* MonoType_GetMethodsByName(void* self, void* name, int32_t bf, uint8
         for (int i = 0; i < c->n_methods; i++)
         {
             const NrMethodDesc* m = &c->methods[i];
-            if (!m->name || is_ctor(m) || !bind_ok(m->flags, bf, c != k) || !name_eq(m->name, name, ic)) continue;
+            if (!m->name || m->mgargs || is_ctor(m) || !bind_ok(m->flags, bf, c != k) || !name_eq(m->name, name, ic)) continue;
             /* an override hides the base declaration */
             int hidden = 0;
             if (c != k && m->slot >= 0)
@@ -408,11 +409,66 @@ static NrClass* class_from_name(const char* full)
     }
     return k && arr ? nr_array_class(k, 1) : k;
 }
+/* compiled instance of def over args: exact, else the reference-type-shared one */
+static NrClass* find_instance(NrClass* d, NrClass** args, int n)
+{
+    NrClass* best = 0;
+    for (int i = 0; i < nr_n_classes; i++)
+    {
+        NrClass* c = nr_classes[i];
+        if (!(c->flags & NR_GENERIC_INST) || c->n_gargs != n || c->image != d->image || strcmp(c->name, d->name) || strcmp(c->ns, d->ns)) continue;
+        int exact = 1, shared = 1;
+        for (int j = 0; j < n; j++)
+        {
+            exact &= c->gargs[j] == args[j];
+            shared &= c->gargs[j] == args[j] || (nr_is_ref(args[j]) && nr_is_ref(c->gargs[j]) && nr_assignable(c->gargs[j], args[j]));
+        }
+        if (exact) return c;
+        if (shared && !best) best = c;
+    }
+    return best;
+}
+/* "Ns.Gen`2[[A, Asm],[B, Asm]][], Asm" (or "[A,B]"): parse at *p, stop at an unmatched ']' or ',' */
+static NrClass* parse_type(const char** p)
+{
+    char name[512]; int n = 0;
+    const char* s = *p;
+    while (*s && *s != '[' && *s != ']' && *s != ',' && n < 511) name[n++] = *s++;
+    while (n && name[n - 1] == ' ') n--;
+    name[n] = 0;
+    NrClass* k = class_from_name(name);
+    if (*s == '[' && s[1] != ']' && s[1] != ',')
+    {
+        NrClass* args[16]; int na = 0;
+        s++;
+        while (*s && *s != ']' && na < 16)
+        {
+            while (*s == ' ' || *s == ',') s++;
+            if (*s == '[')
+            {
+                s++;
+                args[na++] = parse_type(&s);
+                int depth = 0;   /* skip ", Assembly, Version=..." up to this arg's ']' */
+                while (*s && !(*s == ']' && depth == 0)) { if (*s == '[') depth++; else if (*s == ']') depth--; s++; }
+                if (*s == ']') s++;
+            }
+            else args[na++] = parse_type(&s);
+        }
+        if (*s == ']') s++;
+        int ok = k != 0;
+        for (int i = 0; i < na; i++) ok &= args[i] != 0;
+        k = ok ? find_instance(k, args, na) : 0;
+    }
+    while (s[0] == '[' && s[1] == ']') { if (k) k = nr_array_class(k, 1); s += 2; }
+    *p = s;
+    return k;
+}
 static void* Type_internal_from_name(void* name, uint8_t throw_err, uint8_t ic)
 {
     (void)ic;
     char* n = nr_utf8(name);
-    NrClass* k = class_from_name(n);
+    const char* q = n;
+    NrClass* k = strchr(n, '[') ? parse_type(&q) : class_from_name(n);
     if (!k && throw_err) { char msg[1100]; _snprintf(msg, sizeof msg, "type %s not found", n); msg[sizeof msg - 1] = 0; nr_free(n); nr_throw_new("System", "TypeLoadException", msg); }
     nr_free(n);
     return k ? nr_type_object(k) : 0;
@@ -517,8 +573,100 @@ static void* MonoMethodInfo_get_retval_marshal(intptr_t h) { (void)h; return 0; 
 static void* MonoMethod_get_name(void* m) { return nr_str_utf8(GETF(m, const NrMethodDesc*, OBJ(m)->klass, "mhandle")->name); }
 static void* MonoMethod_get_base_definition(void* m) { return m; }
 static uint8_t MonoMethod_false(void* m) { (void)m; return 0; }
-static void* MonoMethod_GetGenericArguments(void* m) { (void)m; return new_array(nr_class_by_name("System", "Type"), 0); }
+#define MH(o) GETF(o, const NrMethodDesc*, OBJ(o)->klass, "mhandle")
+static uint8_t MonoMethod_get_IsGenericMethod(void* m) { return MH(m)->n_mgargs != 0; }
+static uint8_t MonoMethod_get_IsGenericMethodDefinition(void* m) { return MH(m)->n_mgargs && !MH(m)->mgargs; }
+static void* MonoMethod_GetGenericArguments(void* m)
+{
+    const NrMethodDesc* d = MH(m);
+    void* a = new_array(nr_class_by_name("System", "Type"), d->n_mgargs);
+    for (int i = 0; i < d->n_mgargs; i++) adata(a)[i] = nr_type_object(d->mgargs ? d->mgargs[i] : nr_k_object);
+    return a;
+}
+static void* MonoMethod_GetGenericMethodDefinition_impl(void* m)
+{
+    const NrMethodDesc* d = MH(m);
+    if (!d->n_mgargs) return 0;
+    for (int i = 0; i < d->klass->n_methods; i++)
+    {
+        const NrMethodDesc* x = &d->klass->methods[i];
+        if (x->token == d->token && x->n_mgargs && !x->mgargs) return nr_method_object(x);
+    }
+    return m;
+}
+/* Instances are compiled ahead of time. MakeGenericMethod takes the exact one, else
+ * the closest compiled instance its reference-type arguments are assignable to
+ * (the canonical <object,...> one the lifter adds for reflection targets).
+ * ponytail: a shared body sees typeof(T) as its compiled argument, not the requested
+ * one; a real per-call generic context is the upgrade if a title depends on it. */
+static void* MonoMethod_MakeGenericMethod_impl(void* m, void* types)
+{
+    const NrMethodDesc* d = MH(m);
+    int n = types ? (int)ARR(types)->max_length : 0;
+    if (!d->n_mgargs || n != d->n_mgargs) nr_throw_new("System", "InvalidOperationException", "not a generic method definition");
+    const NrMethodDesc* best = 0; int bestScore = -1;
+    for (int i = 0; i < d->klass->n_methods; i++)
+    {
+        const NrMethodDesc* x = &d->klass->methods[i];
+        if (x->token != d->token || !x->mgargs || x->n_mgargs != n) continue;
+        int score = 0, ok = 1;
+        for (int j = 0; j < n && ok; j++)
+        {
+            NrClass *want = K(adata(types)[j]), *have = x->mgargs[j];
+            if (want == have) score += 2;
+            else ok = have && nr_is_ref(want) && nr_is_ref(have) && nr_assignable(have, want);
+        }
+        if (ok && score > bestScore) { best = x; bestScore = score; }
+    }
+    if (best) return nr_method_object(best);
+    char msg[300];
+    _snprintf(msg, sizeof msg, "%s.%s::%s with these arguments was not compiled", d->klass->ns, d->klass->name, d->name);
+    msg[sizeof msg - 1] = 0;
+    nr_throw_notsupported(msg);
+}
+/* A generic virtual method's instance has no slot: find the receiver's own instance. */
+static const NrMethodDesc* gvm_target(const NrMethodDesc* m, void* obj)
+{
+    if (!obj || !m->mgargs || !(m->flags & 0x40)) return m;
+    const char* nm = strrchr(m->name, '.') ? strrchr(m->name, '.') + 1 : m->name;
+    for (NrClass* c = OBJ(obj)->klass; c; c = c->parent)
+        for (int i = 0; i < c->n_methods; i++)
+        {
+            const NrMethodDesc* x = &c->methods[i];
+            if (!x->fn || !x->mgargs || x->n_mgargs != m->n_mgargs || x->n_params != m->n_params) continue;
+            const char* xn = strrchr(x->name, '.') ? strrchr(x->name, '.') + 1 : x->name;
+            if (strcmp(xn, nm)) continue;
+            int ok = 1;
+            for (int j = 0; j < m->n_mgargs && ok; j++) ok = x->mgargs[j] == m->mgargs[j];
+            if (ok) return x;
+        }
+    return m;
+}
 static void* MonoMethod_GetDllImportAttribute(intptr_t h) { (void)h; return 0; }
+
+/* A method of a generic class instance nothing called directly (reflection only, e.g.
+ * a serializer calling List<T>.AddRange) runs the canonical instance's body: the same
+ * class over object for every reference-type argument has the same layout and code.
+ * The lifter compiles the public methods of those canonical instances. */
+static const NrMethodDesc* canonical_method(const NrMethodDesc* m)
+{
+    NrClass* k = m->klass;
+    if (m->fn || !(k->flags & NR_GENERIC_INST)) return m;
+    for (int i = 0; i < nr_n_classes; i++)
+    {
+        NrClass* c = nr_classes[i];
+        if (c == k || !(c->flags & NR_GENERIC_INST) || c->n_gargs != k->n_gargs || c->image != k->image
+            || strcmp(c->name, k->name) || strcmp(c->ns, k->ns)) continue;
+        int ok = 1;
+        for (int j = 0; j < k->n_gargs && ok; j++)
+            ok = nr_is_ref(k->gargs[j]) ? nr_is_ref(c->gargs[j]) && nr_assignable(c->gargs[j], k->gargs[j]) : c->gargs[j] == k->gargs[j];
+        if (!ok) continue;
+        for (int j = 0; j < c->n_methods; j++)
+            if (c->methods[j].token == m->token && c->methods[j].fn && c->methods[j].n_params == m->n_params && !c->methods[j].mgargs)
+                return &c->methods[j];
+    }
+    return m;
+}
 
 /* MethodBase.Invoke: args are boxed; value-type parameters get a pointer
  * into the box, byref parameters a pointer to the slot, written back. */
@@ -543,10 +691,14 @@ static void* invoke(void* mobj, void* obj, void* params, void** exc, int ctor)
     }
     if (ctor && !obj)
     {
-        void* o = nr_new(m->klass);
-        nr_invoke(m, (m->klass->flags & NR_VALUETYPE) ? (char*)o + sizeof(NrObj) : o, argv, exc);
+        NrClass* want = m->klass;   /* allocate what was asked for; the body may be shared */
+        if (!m->fn) m = canonical_method(m);
+        void* o = nr_new(want);
+        nr_invoke(m, (want->flags & NR_VALUETYPE) ? (char*)o + sizeof(NrObj) : o, argv, exc);
         return *exc ? 0 : o;
     }
+    if (m->mgargs && !ctor) m = gvm_target(m, obj);
+    if (!m->fn) m = canonical_method(m);
     const NrMethodDesc* target = m;
     void* fn = nr_virtual_desc(m, obj, &target);
     if (fn != m->fn)
@@ -832,8 +984,10 @@ void nr_register_reflect_icalls(void)
         { "System.Reflection.MonoMethodInfo::get_retval_marshal", MonoMethodInfo_get_retval_marshal },
         { "System.Reflection.MonoMethod::get_name", MonoMethod_get_name },
         { "System.Reflection.MonoMethod::get_base_definition", MonoMethod_get_base_definition },
-        { "System.Reflection.MonoMethod::get_IsGenericMethod", MonoMethod_false },
-        { "System.Reflection.MonoMethod::get_IsGenericMethodDefinition", MonoMethod_false },
+        { "System.Reflection.MonoMethod::get_IsGenericMethod", MonoMethod_get_IsGenericMethod },
+        { "System.Reflection.MonoMethod::get_IsGenericMethodDefinition", MonoMethod_get_IsGenericMethodDefinition },
+        { "System.Reflection.MonoMethod::MakeGenericMethod_impl", MonoMethod_MakeGenericMethod_impl },
+        { "System.Reflection.MonoMethod::GetGenericMethodDefinition_impl", MonoMethod_GetGenericMethodDefinition_impl },
         { "System.Reflection.MonoMethod::GetGenericArguments", MonoMethod_GetGenericArguments },
         { "System.Reflection.MonoMethod::GetDllImportAttribute", MonoMethod_GetDllImportAttribute },
         { "System.Reflection.MonoMethod::InternalInvoke", MonoMethod_InternalInvoke },

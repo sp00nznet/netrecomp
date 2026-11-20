@@ -58,7 +58,7 @@ sealed class MetaWriter
 
     public void Close()
     {
-        foreach (var m in g.Order) { if (!methodsOf.TryGetValue(m.Owner, out var l)) methodsOf[m.Owner] = l = new(); l.Add(m); }
+        foreach (var m in g.Order.Concat(g.Gvms.Keys).Concat(g.ReflectInst).Distinct()) { if (!methodsOf.TryGetValue(m.Owner, out var l)) methodsOf[m.Owner] = l = new(); l.Add(m); }
         var work = new Queue<TT>(g.KlassUsed.Concat(g.Constructed).Concat(g.ObjUsed).Concat(g.StaticsUsed));
         var seen = new HashSet<TT>();
         while (work.Count > 0)
@@ -76,6 +76,7 @@ sealed class MetaWriter
                 if (t.K is TK.SzArray or TK.Array or TK.Ptr or TK.ByRef) Add(t.Elem);
                 foreach (var (i, _) in L.Ifaces) Add(i);
                 foreach (var a in t.Args) Add(a);
+                if (t.K == TK.Def && t.Args.Length > 0) Add(w.Inst(t.Def, Array.Empty<TT>()));   // GetGenericTypeDefinition
                 if (t.IsEnum) Add(lay.EnumBase(t));
                 if (t.K == TK.Def && !t.IsOpen)
                     foreach (var f in t.Def.Fields) Add(Strip(w.FieldType(t, f)));
@@ -95,12 +96,17 @@ sealed class MetaWriter
                 foreach (var md in t.Def.Methods)
                     if (!md.HasGenericParameters) list.Add(w.Method(t, md, Array.Empty<TT>()));
                 if (methodsOf.TryGetValue(t, out var extra)) foreach (var x in extra) if (!list.Contains(x)) list.Add(x);
+                // generic method definitions last (name lookups find real methods first);
+                // reflection's MakeGenericMethod picks among the compiled instances above
+                foreach (var md in t.Def.Methods)
+                    if (md.HasGenericParameters) { var d = new MI { Owner = t, Def = md, Key = t.Key + "::" + md.Name + "<def>" + md.MetadataToken.ToUInt32() }; gdefs.Add(d); list.Add(d); }
             }
             for (int i = 0; i < list.Count; i++) descIndex[list[i]] = (t.Id, i);
             mlists[t] = list;
         }
     }
     readonly Dictionary<TT, List<MI>> mlists = new();
+    readonly HashSet<MI> gdefs = new();
 
     TT Strip(TT t) => t.K == TK.ByRef ? t.Elem : t;
     string K(TT t) => "K" + lay.Id(t);
@@ -446,10 +452,15 @@ sealed class MetaWriter
                 }
             }
             catch (Exception e) when (e is UnresolvedGeneric or KeyNotFoundException) { ret = "0"; }
+            if (gdefs.Contains(m))
+            {
+                ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", 0, 0, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, -1, 0, 0, 0, 0x{m.Def.MetadataToken.ToUInt32():x}, 0, 0, 0, {m.Def.GenericParameters.Count} }}");
+                continue;
+            }
             int slot = m.Def.IsVirtual && L.SlotOf.TryGetValue(m.Def, out var s) ? s : -1;
             var fn = live ? $"(void*){g.NameOf(m)}" : "0";
             var invk = live ? Invoker(m) : "0";
-            ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", {fn}, {invk}, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, {slot}, {ret}, {pars}, {pby}, 0x{m.Def.MetadataToken.ToUInt32():x}, {(m.MArgs.Length == 0 ? g.At.Table(t, m.Def, KRef) : "0, 0")} }}");
+            ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", {fn}, {invk}, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, {slot}, {ret}, {pars}, {pby}, 0x{m.Def.MetadataToken.ToUInt32():x}, {(m.MArgs.Length == 0 ? g.At.Table(t, m.Def, KRef) : "0, 0")}{(m.MArgs.Length == 0 ? "" : $", (NrClass* const[]){{ {string.Join(", ", m.MArgs.Select(KRef))} }}, {m.MArgs.Length}")} }}");
         }
         sb.Append($"const NrMethodDesc ML{id}[] = {{\n    {string.Join(",\n    ", ml.DefaultIfEmpty("{ 0 }"))} }};\n");
 

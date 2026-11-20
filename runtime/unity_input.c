@@ -9,6 +9,7 @@
  *
  *   move X Y        click X Y       down / up      (left button)
  *   rclick X Y      key VK          wait MS
+ *   text STRING     types STRING as WM_CHAR messages (text fields)
  *   shot PATH       the game saves its next frame as a PNG (Application.CaptureScreenshot,
  *                   so it works on a hidden desktop where GDI captures come back wrong)
  *
@@ -120,6 +121,8 @@ static void run_command(char* line)
         btn_down[v] = 1; PostMessageA(in_hwnd, WM_KEYDOWN, v, 1); Sleep(120);
         btn_down[v] = 0; PostMessageA(in_hwnd, WM_KEYUP, v, 0xC0000001);
     }
+    else if (!strncmp(line, "text ", 5))
+        for (const char* c = line + 5; *c; c++) { PostMessageA(in_hwnd, WM_CHAR, (unsigned char)*c, 1); Sleep(40); }
     else if (sscanf(line, "wait %d", &v) == 1) Sleep(v);
     else if (!strncmp(line, "shot ", 5))
     {
