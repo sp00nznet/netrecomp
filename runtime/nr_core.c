@@ -360,7 +360,11 @@ void* nr_iface(void* o, NrClass* iface, int k)
             if (x == iface || x->n_gargs != iface->n_gargs || x->image != iface->image || strcmp(x->name, iface->name) || strcmp(x->ns, iface->ns)) continue;
             int ok = 1;
             for (int j = 0; j < x->n_gargs && ok; j++)
-                ok = x->gargs[j] == iface->gargs[j] || (nr_is_ref(x->gargs[j]) && nr_is_ref(iface->gargs[j]) && nr_assignable(iface->gargs[j], x->gargs[j]));
+                ok = x->gargs[j] == iface->gargs[j] || (nr_is_ref(x->gargs[j]) && nr_is_ref(iface->gargs[j])
+                     /* also the canonical object instance standing in for a reference T: the
+                        shared InternalEnumerator<object> a run-time T[] hands out, asked for
+                        IEnumerator<T>. The objects it yields are T's. */
+                     && (nr_assignable(iface->gargs[j], x->gargs[j]) || x->gargs[j] == nr_k_object));
             int32_t off = c->ifaces[i].offset;
             if (ok && off >= 0 && c->vtable[off + k]) return c->vtable[off + k];
         }
