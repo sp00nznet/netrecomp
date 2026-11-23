@@ -875,6 +875,7 @@ void* nr_pinvoke(const char* lib, const char* entry, const char* alt)
         path[sizeof path - 1] = 0;
         h = LoadLibraryA(path);
     }
+    { void nr_net_guard_scan(void); nr_net_guard_scan(); }   /* its imports obey the network policy */
     void* f = 0;
     if (h)
     {
@@ -1116,6 +1117,7 @@ void nr_init(void)
     nr_trace_icalls = GetEnvironmentVariableA("NR_TRACE_ICALLS", 0, 0) > 0;
     GC_allow_register_threads();
     add_module_roots((HMODULE)&__ImageBase);
+    { void nr_net_guard_start(void); nr_net_guard_start(); }   /* network policy before any game code runs */
     fin_event = CreateEventA(0, FALSE, FALSE, 0);
     GC_set_finalizer_notifier(fin_notify);
     CreateThread(0, 0, fin_thread, 0, 0, 0);
