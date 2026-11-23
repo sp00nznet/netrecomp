@@ -820,10 +820,17 @@ static void* find_export(HMODULE h, const char* entry)
 /* Library lookup order: the module itself for __Internal, then LoadLibrary
  * (with and without .dll), and only then the host's plugin hooks, which in a
  * Unity player log every miss. */
+static intptr_t no_steam_entry(void) { return 0; }
+
 void* nr_pinvoke(const char* lib, const char* entry, const char* alt)
 {
     HMODULE h = 0;
     char path[MAX_PATH * 2];
+    /* NR_NO_STEAM=1: every steam_api call returns 0 (SteamAPI_Init fails), so a test
+     * run can't touch the player's Steam Cloud files, stats or achievements. */
+    static int no_steam = -1;
+    if (no_steam < 0) no_steam = GetEnvironmentVariableA("NR_NO_STEAM", path, sizeof path) > 0 && path[0] != '0';
+    if (no_steam && (strstr(lib, "steam_api") || strstr(lib, "CSteamworks") || strstr(lib, "Steamworks"))) return (void*)no_steam_entry;
     if (!strcmp(lib, "__Internal")) h = GetModuleHandleA(0);
     if (!h) h = LoadLibraryA(lib);
     if (!h)
@@ -832,6 +839,7 @@ void* nr_pinvoke(const char* lib, const char* entry, const char* alt)
         path[sizeof path - 1] = 0;
         h = LoadLibraryA(path);
     }
+    { void nr_net_guard_scan(void); nr_net_guard_scan(); }   /* its imports obey the network policy */
     void* f = 0;
     if (h)
     {
@@ -1073,6 +1081,7 @@ void nr_init(void)
     nr_trace_icalls = GetEnvironmentVariableA("NR_TRACE_ICALLS", 0, 0) > 0;
     GC_allow_register_threads();
     add_module_roots((HMODULE)&__ImageBase);
+    { void nr_net_guard_start(void); nr_net_guard_start(); }   /* network policy before any game code runs */
     fin_event = CreateEventA(0, FALSE, FALSE, 0);
     GC_set_finalizer_notifier(fin_notify);
     CreateThread(0, 0, fin_thread, 0, 0, 0);
