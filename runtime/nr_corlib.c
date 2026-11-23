@@ -2109,7 +2109,33 @@ static uint8_t MonoIO_DuplicateHandle(intptr_t sp, intptr_t sh, intptr_t tp, int
 /* ---- culture: invariant only (CultureInfo falls back to it) ---- */
 static void* CultureInfo_get_current_locale_name(void) { return 0; }
 static void* CultureInfo_internal_get_cultures(uint8_t n, uint8_t s, uint8_t i) { (void)n; (void)s; (void)i; return nr_newarr(nr_array_class(nr_class_by_name("System.Globalization", "CultureInfo"), 1), 0); }
-static uint8_t CultureData_fill_culture_data(void* self, int32_t idx) { (void)self; (void)idx; return 0; }
+/* mono fills a named culture's time data from its native tables, which aren't
+ * here; left empty, DateTime.ToString under that culture dereferenced null
+ * LongTimes (BATTLETECH: StoryConstantsDef, so SimGameConstants never loaded).
+ * ponytail: every named culture gets en-US time data; ship mono's culture
+ * tables if a title formats times for another locale. */
+static void* str_array(const char* const* v, int n)
+{
+    void* a = nr_newarr(nr_array_class(nr_k_string, 1), n);
+    for (int i = 0; i < n; i++) ((void**)((NrArray*)a)->vector)[i] = nr_str_utf8(v[i]);
+    return a;
+}
+static void CultureData_fill_culture_data(void* self, int32_t idx)
+{
+    (void)idx;
+    NrClass* k = OBJ(self)->klass;
+    static const char* const lt[] = { "h:mm:ss tt", "hh:mm:ss tt", "H:mm:ss", "HH:mm:ss" };
+    static const char* const st[] = { "h:mm tt", "hh:mm tt", "H:mm", "HH:mm" };
+    int32_t o;
+#define SETREF(n, v) if ((o = foff(k, n)) > 0) FIELD(self, void*, o) = (v)
+    SETREF("sAM1159", nr_str_utf8("AM"));
+    SETREF("sPM2359", nr_str_utf8("PM"));
+    SETREF("sTimeSeparator", nr_str_utf8(":"));
+    SETREF("saLongTimes", str_array(lt, 4));
+    SETREF("saShortTimes", str_array(st, 4));
+#undef SETREF
+    /* iFirstDayOfWeek, iFirstWeekOfYear: 0 (Sunday, FirstDay) as allocated */
+}
 static void CultureData_fill_number_data(void* nfi, int32_t idx) { (void)nfi; (void)idx; }
 static uint8_t CalendarData_fill_calendar_data(void* self, void* name, int32_t id) { (void)self; (void)name; (void)id; return 0; }
 static void CompareInfo_assign_sortkey4(void* self, void* key, void* src, int32_t opts) { CompareInfo_assign_sortkey(self, key, src, opts); }

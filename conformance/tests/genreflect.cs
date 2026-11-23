@@ -24,6 +24,10 @@ static class P
         Console.WriteLine(Type.GetType("System.Collections.Generic.List`1[[System.String, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089]]") == ls.GetType());
         Console.WriteLine(Type.GetType("System.Collections.Generic.List`1[System.String][]") == typeof(System.Collections.Generic.List<string>[]));
         Console.WriteLine(ls.GetType().GetGenericTypeDefinition() == typeof(System.Collections.Generic.List<>));
+        // array types have runtime constructors (a serializer's Activator.CreateInstance(T[], n))
+        Box[] arr = (Box[])Activator.CreateInstance(typeof(Box[]), 3);
+        int[,] md = (int[,])Activator.CreateInstance(typeof(int[,]), 2, 3);
+        Console.WriteLine(arr.Length + " " + md.Length + " " + md.GetLength(1));
         return 3;
     }
 }
