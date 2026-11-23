@@ -1,6 +1,6 @@
 {
-  "passed": 11,
-  "total": 13,
+  "passed": 12,
+  "total": 14,
   "results": {
     "basics": "PASS",
     "collections": "FAIL (output)",
@@ -10,6 +10,7 @@
     "hashing": "PASS",
     "interop": "PASS",
     "io": "PASS",
+    "nreloop": "PASS",
     "runtime": "PASS",
     "seh": "PASS",
     "sockets": "FAIL (output)",
