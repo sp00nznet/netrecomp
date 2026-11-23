@@ -68,6 +68,7 @@ static class Program
         Console.WriteLine(new DateTime(2013, 7, 25, 10, 30, 0).ToString("yyyy-MM-dd HH:mm", inv));
         Console.WriteLine(TimeSpan.FromSeconds(3725).ToString());
         Console.WriteLine(Convert.ToBase64String(new byte[] { 1, 2, 3, 250 }));
+        Console.WriteLine(BitConverter.ToString(Convert.FromBase64String(" AQID+g== ")));
         Console.WriteLine(BitConverter.ToString(BitConverter.GetBytes(0x01020304)));
         Console.WriteLine(Guid.Empty.ToString());
 

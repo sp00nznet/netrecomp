@@ -123,6 +123,35 @@ static int32_t ValueType_InternalGetHashCode(void* o, void** fields)
 
 /* ---- System.String ---- */
 
+/* Convert.FromBase64String / FromBase64CharArray (Chronicles' APlay socket protocol) */
+static void* b64_decode(const uint16_t* c, int32_t n)
+{
+    uint8_t* out = (uint8_t*)malloc((size_t)n * 3 / 4 + 3);
+    uint32_t acc = 0; int bits = 0, len = 0, pad = 0;
+    for (int32_t i = 0; i < n; i++)
+    {
+        uint16_t ch = c[i]; int v;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+        if (ch == '=') { pad++; continue; }
+        if (pad) v = -1;
+        else if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+        else if (ch == '+') v = 62;
+        else if (ch == '/') v = 63;
+        else v = -1;
+        if (v < 0) { free(out); nr_throw_new("System", "FormatException", "The input is not a valid Base-64 string"); }
+        acc = (acc << 6) | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[len++] = (uint8_t)(acc >> bits); }
+    }
+    if (pad > 2) { free(out); nr_throw_new("System", "FormatException", "The input is not a valid Base-64 string"); }
+    void* a = nr_newarr(nr_array_class(nr_class_by_name("System", "Byte"), 1), len);
+    memcpy(((NrArray*)a)->vector, out, (size_t)len);
+    free(out);
+    return a;
+}
+static void* Convert_InternalFromBase64String(NrString* s, uint8_t ws) { (void)ws; return b64_decode(s->chars, s->length); }
+static void* Convert_InternalFromBase64CharArray(NrArray* a, int32_t off, int32_t n) { return b64_decode((uint16_t*)a->vector + off, n); }
 static void* String_InternalAllocateStr(int32_t len) { return nr_str_alloc(len); }
 
 typedef struct Intern { NrString* s; struct Intern* next; } Intern;
@@ -1274,6 +1303,8 @@ static const NrIcall corlib[] = {
     { "System.ValueType::InternalEquals", ValueType_InternalEquals },
     { "System.ValueType::InternalGetHashCode", ValueType_InternalGetHashCode },
     { "System.String::InternalAllocateStr", String_InternalAllocateStr },
+    { "System.Convert::InternalFromBase64String", Convert_InternalFromBase64String },
+    { "System.Convert::InternalFromBase64CharArray", Convert_InternalFromBase64CharArray },
     { "System.String::InternalIntern", String_InternalIntern },
     { "System.String::InternalIsInterned", String_InternalIsInterned },
     { "System.String::InternalSplit", String_InternalSplit },

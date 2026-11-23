@@ -192,6 +192,9 @@ void* nr_new(NrClass* k)
 void* nr_newarr(NrClass* k, int32_t n)
 {
     if (n < 0) nr_throw_overflow();
+    /* a generated T[] the lift saw named but never allocated has no vtable (JsonFx made
+       CharacterTypeDifficultyEntry[] by reflection, then ToString faulted on it) */
+    if (!k->vtable) borrow_vtable(k);
     uint64_t size = 16 + (uint64_t)k->elem_size * (uint32_t)n;
     if (size > 0x7fffffff) nr_throw_new("System", "OutOfMemoryException", "Array too large");
     NrArray* a = (NrArray*)gc_alloc(k, (size_t)size);
