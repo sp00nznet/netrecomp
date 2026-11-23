@@ -1062,12 +1062,32 @@ static NrClass* need(const char* ns, const char* name)
     return k;
 }
 
+/* NR_DATA_DIR: the per-user environment variables point into it too (HOME, HOMEDRIVE+
+ * HOMEPATH, USERPROFILE, APPDATA, LOCALAPPDATA), for games that build their save folder
+ * from them (Shadowrun Hong Kong: %HOMEDRIVE%%HOMEPATH%/AppData/Local/...), so a test run
+ * can't write the player's real folders. */
+static void data_dir_env(void)
+{
+    wchar_t dd[MAX_PATH], full[MAX_PATH], sub[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"NR_DATA_DIR", dd, MAX_PATH) || !GetFullPathNameW(dd, MAX_PATH, full, 0)) return;
+    _snwprintf(sub, MAX_PATH, L"%s\\home", full); sub[MAX_PATH - 1] = 0;
+    CreateDirectoryW(full, 0); CreateDirectoryW(sub, 0);
+    SetEnvironmentVariableW(L"HOME", sub);
+    SetEnvironmentVariableW(L"USERPROFILE", sub);
+    if (sub[1] == L':') { wchar_t drv[3] = { sub[0], L':', 0 }; SetEnvironmentVariableW(L"HOMEDRIVE", drv); SetEnvironmentVariableW(L"HOMEPATH", sub + 2); }
+    wchar_t ad[MAX_PATH];
+    _snwprintf(ad, MAX_PATH, L"%s\\AppData", sub); ad[MAX_PATH - 1] = 0; CreateDirectoryW(ad, 0);
+    _snwprintf(ad, MAX_PATH, L"%s\\AppData\\Roaming", sub); ad[MAX_PATH - 1] = 0; CreateDirectoryW(ad, 0); SetEnvironmentVariableW(L"APPDATA", ad);
+    _snwprintf(ad, MAX_PATH, L"%s\\AppData\\Local", sub); ad[MAX_PATH - 1] = 0; CreateDirectoryW(ad, 0); SetEnvironmentVariableW(L"LOCALAPPDATA", ad);
+}
+
 void nr_init(void)
 {
     static int done;
     if (done) return;
     done = 1;
     nr_debug();
+    data_dir_env();
     InitializeCriticalSection(&arr_lock);
     InitializeCriticalSection(&str_lock);
     InitializeCriticalSection(&cctor_lock);
