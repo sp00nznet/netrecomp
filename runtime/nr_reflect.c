@@ -189,7 +189,10 @@ static int32_t Type_GetTypeCodeInternal(void* t)
     return 1;  /* Object */
 }
 static void* Type_make_array_type(void* self, int32_t rank) { return nr_type_object(nr_array_class(K(self), rank ? rank : 1)); }
-static void* Type_make_byref_type(void* self) { (void)self; nr_throw_notsupported("Type.MakeByRefType"); }
+/* Byref-ness lives on each parameter (param_byref), not in a type object, and
+ * parameter matching ignores it: T& stands as T, so GetMethod(name, {T&}) finds
+ * the ref overload. ponytail: IsByRef reads false on the result. */
+static void* Type_make_byref_type(void* self) { return self; }
 static void* Type_MakePointerType(void* self) { (void)self; nr_throw_notsupported("Type.MakePointerType"); }
 static void Type_GetPacking(void* self, int32_t* packing, int32_t* size) { (void)self; *packing = 0; *size = 0; }
 
