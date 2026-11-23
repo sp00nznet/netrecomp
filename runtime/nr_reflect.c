@@ -599,6 +599,46 @@ static void* MonoMethod_GetGenericMethodDefinition_impl(void* m)
  * (the canonical <object,...> one the lifter adds for reflection targets).
  * ponytail: a shared body sees typeof(T) as its compiled argument, not the requested
  * one; a real per-call generic context is the upgrade if a title depends on it. */
+/* A shared instance picked for other arguments returns C<object> where the caller asked
+ * for C<T> (Enumerable.ToList<T> -> List<object>), which FieldInfo.SetValue then refuses.
+ * The variant is the shared instance with its return type closed over the requested
+ * arguments; invoke() gives the result that class (same layout, same shared code).
+ * One variant per (instance, arguments), kept for the process. */
+static NrClass* close_over(NrClass* r, const NrMethodDesc* x, void* types)
+{
+    for (int i = 0; i < x->n_mgargs; i++) if (r == x->mgargs[i]) return K(adata(types)[i]);
+    if (!r || !(r->flags & NR_GENERIC_INST) || r->n_gargs > 16) return r;
+    NrClass* a[16];
+    for (int j = 0; j < r->n_gargs; j++) a[j] = close_over(r->gargs[j], x, types);
+    NrClass* c = find_instance(r, a, r->n_gargs);
+    for (int j = 0; c && j < r->n_gargs; j++) if (c->gargs[j] != a[j]) c = 0;
+    return c ? c : r;
+}
+typedef struct Variant { const NrMethodDesc* base; NrClass* args[8]; NrMethodDesc d; struct Variant* next; } Variant;
+static Variant* variants;
+static const NrMethodDesc* shared_variant(const NrMethodDesc* x, void* types)
+{
+    int n = x->n_mgargs;
+    NrClass* ret = close_over(x->ret, x, types);
+    if (ret == x->ret || n > 8) return x;
+    EnterCriticalSection(&cache_lock);
+    Variant* v = variants;
+    for (; v; v = v->next)
+    {
+        int ok = v->base == x;
+        for (int j = 0; j < n && ok; j++) ok = v->args[j] == K(adata(types)[j]);
+        if (ok) break;
+    }
+    if (!v)
+    {
+        v = (Variant*)calloc(1, sizeof *v);
+        v->base = x; v->d = *x; v->d.ret = ret;
+        for (int j = 0; j < n; j++) v->args[j] = K(adata(types)[j]);
+        v->next = variants; variants = v;
+    }
+    LeaveCriticalSection(&cache_lock);
+    return &v->d;
+}
 static void* MonoMethod_MakeGenericMethod_impl(void* m, void* types)
 {
     const NrMethodDesc* d = MH(m);
@@ -618,6 +658,7 @@ static void* MonoMethod_MakeGenericMethod_impl(void* m, void* types)
         }
         if (ok && score > bestScore) { best = x; bestScore = score; }
     }
+    if (best && bestScore < 2 * n) best = shared_variant(best, types);
     if (best) return nr_method_object(best);
     char msg[300];
     _snprintf(msg, sizeof msg, "%s.%s::%s with these arguments was not compiled", d->klass->ns, d->klass->name, d->name);
@@ -684,7 +725,7 @@ static void* invoke(void* mobj, void* obj, void* params, void** exc, int ctor)
         int byref = m->param_byref && m->param_byref[i];
         if (pt && !nr_is_ref(pt))
         {
-            if (!*slot) *slot = nr_box(pt, &(int64_t[8]){ 0 });
+            if (!*slot) *slot = nr_new(pt);   /* zeroed box of any size */
             argv[i] = (char*)*slot + sizeof(NrObj);
         }
         else argv[i] = byref ? (void*)slot : *slot;
@@ -697,17 +738,32 @@ static void* invoke(void* mobj, void* obj, void* params, void** exc, int ctor)
         nr_invoke(m, (want->flags & NR_VALUETYPE) ? (char*)o + sizeof(NrObj) : o, argv, exc);
         return *exc ? 0 : o;
     }
+    NrClass* want = m->ret;
     if (m->mgargs && !ctor) m = gvm_target(m, obj);
     if (!m->fn) m = canonical_method(m);
     const NrMethodDesc* target = m;
     void* fn = nr_virtual_desc(m, obj, &target);
+    void* r;
     if (fn != m->fn)
     {
         NrMethodDesc tmp = *m;
         tmp.fn = fn;
-        return nr_invoke(&tmp, obj, argv, exc);
+        r = nr_invoke(&tmp, obj, argv, exc);
     }
-    return nr_invoke(m, obj, argv, exc);
+    else r = nr_invoke(m, obj, argv, exc);
+    /* a shared_variant's result: the shared C<object> becomes the requested C<T>.
+     * ponytail: retags the object itself, right for the fresh result of a builder
+     * (ToList, ToArray-like); a per-call generic context in the lift is the upgrade. */
+    if (r && !*exc && want && (want->flags & NR_GENERIC_INST) && nr_is_ref(want))
+    {
+        NrClass* k = OBJ(r)->klass;
+        if (k != want && !nr_assignable(want, k) && nr_assignable(k, want))
+        {
+            if (!want->vtable) (void)nr_new(want);   /* borrows the shared vtable */
+            OBJ(r)->klass = want;
+        }
+    }
+    return r;
 }
 static void* MonoMethod_InternalInvoke(void* self, void* obj, void* params, void** exc) { return invoke(self, obj, params, exc, 0); }
 static void* MonoCMethod_InternalInvoke(void* self, void* obj, void* params, void** exc) { return invoke(self, obj, params, exc, 1); }

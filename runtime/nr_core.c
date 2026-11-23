@@ -7,6 +7,7 @@
  * in the catch filter. See docs/runtime.md. */
 #include "nrrt.h"
 #include <stdarg.h>
+#include <malloc.h>
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
@@ -470,6 +471,7 @@ void nr_throw_notsupported(const char* what)
 
 /* A hardware fault seen by several filters on its way up must become one
  * managed object, not one per filter. */
+static __declspec(thread) const NrMethodDesc* nr_inv_stack[64]; static __declspec(thread) int nr_inv_depth;   /* NR_DEBUG: methods nr_invoke is inside */
 static __declspec(thread) EXCEPTION_RECORD* last_rec;
 static __declspec(thread) void* last_obj;
 
@@ -963,7 +965,10 @@ void* nr_virtual_desc(const NrMethodDesc* m, void* obj, const NrMethodDesc** out
 
 void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
 {
-    uint64_t raw[16];
+    uint64_t small[16];
+    /* the invoker writes the whole return value here: a large struct (BATTLETECH's
+       CombatUIConstants) overruns any fixed buffer and with it this frame */
+    void* raw = m->ret && !nr_is_ref(m->ret) && m->ret->value_size > (int32_t)sizeof small ? _alloca((size_t)m->ret->value_size + 16) : small;
     void* ret = 0;
     if (exc) *exc = 0;
     if (!m->fn || !m->invoke)
@@ -981,6 +986,8 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
     void* boxed_this = obj;
     if (obj && (m->klass->flags & NR_VALUETYPE) && ((NrObj*)obj)->klass == m->klass && !(m->flags & 0x10))
         obj = (char*)obj + sizeof(NrObj);   /* boxed receiver for a value-type method */
+    if (nr_inv_depth < 64) nr_inv_stack[nr_inv_depth] = m;
+    nr_inv_depth++;
     __try
     {
         m->invoke(m->fn, obj, args, raw);
@@ -989,9 +996,11 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
             ret = nr_is_ref(rk) ? *(void**)raw : nr_box(rk, raw);
     }
     __except (nr_catch(GetExceptionInformation(), 0, (void**)&e)) { }
+    nr_inv_depth--;
     (void)boxed_this;
     if (e)
     {
+        if (nr_debug()) nr_log("netrecomp:   in %s.%s::%s\n", m->klass->ns, m->klass->name, m->name);
         if (exc) { *exc = e; return 0; }
         nr_throw(e);
     }
