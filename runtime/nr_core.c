@@ -472,14 +472,19 @@ void nr_throw_notsupported(const char* what)
 /* A hardware fault seen by several filters on its way up must become one
  * managed object, not one per filter. */
 static __declspec(thread) const NrMethodDesc* nr_inv_stack[64]; static __declspec(thread) int nr_inv_depth;   /* NR_DEBUG: methods nr_invoke is inside */
+/* The cache lives for one dispatch: nr_catch clears it when a handler is chosen.
+ * A fault repeated every frame from the same instruction and stack depth reuses
+ * the record's address, and handing out the old (maybe collected) object made
+ * "throw (null).(null)". The object sits in a GC-visible slot while cached. */
 static __declspec(thread) EXCEPTION_RECORD* last_rec;
-static __declspec(thread) void* last_obj;
+static __declspec(thread) void** last_slot;
 
 void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
 {
     EXCEPTION_RECORD* r = ep->ExceptionRecord;
     if (r->ExceptionCode == NR_EXC_CODE && r->NumberParameters >= 1) return (void*)r->ExceptionInformation[0];
-    if (last_rec == r && last_obj) return last_obj;
+    if (!last_slot) last_slot = (void**)GC_MALLOC_UNCOLLECTABLE(sizeof(void*));
+    if (last_rec == r && *last_slot) return *last_slot;
     const char* name = 0; const char* msg = 0;
     switch (r->ExceptionCode)
     {
@@ -499,9 +504,9 @@ void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
     }
     NrClass* k = nr_class_by_name("System", name);
     if (!k) return 0;
-    last_obj = nr_exception(k, msg);
+    *last_slot = nr_exception(k, msg);
     last_rec = r;
-    return last_obj;
+    return *last_slot;
 }
 
 /* Generated filters pass null out-pointers: clang outlines x86 filters, and in
@@ -530,6 +535,7 @@ int nr_catch(struct _EXCEPTION_POINTERS* ep, NrClass* k, void** ex)
     if (!o) return EXCEPTION_CONTINUE_SEARCH;
     if (k && !nr_isinst(o, k)) return EXCEPTION_CONTINUE_SEARCH;
     if (ex) *ex = o; else stash(o, 0);
+    last_rec = 0;
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -541,6 +547,7 @@ int nr_catch_any(struct _EXCEPTION_POINTERS* ep, NrClass* const* ks, int n, void
         if (nr_isinst(o, ks[i]))
         {
             if (ex) { *ex = o; *which = i; } else stash(o, i);
+            last_rec = 0;
             return EXCEPTION_EXECUTE_HANDLER;
         }
     return EXCEPTION_CONTINUE_SEARCH;
