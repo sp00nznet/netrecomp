@@ -140,20 +140,24 @@ static void* Type_GetGenericTypeDefinition_impl(void* self)
     nr_log("netrecomp: no generic definition record for %s.%s\n", k->ns, k->name);
     return 0;
 }
+static NrClass* find_instance(NrClass* d, NrClass** args, int n);
+/* exact compiled instance, else the reference-type-shared one (as Type.GetType does):
+   Chronicles makes List<AttributeBackedStatusValueContainer> by reflection */
 static void* Type_MakeGenericType(void* gt, void* types)
 {
     NrClass* d = K(gt);
     int n = (int)ARR(types)->max_length;
-    for (int i = 0; i < nr_n_classes; i++)
+    NrClass* args[16];
+    for (int j = 0; j < n && j < 16; j++) args[j] = K(adata(types)[j]);
+    NrClass* c = n <= 16 ? find_instance(d, args, n) : 0;
+    if (c) return nr_type_object(c);
+    char msg[600];
+    int len = _snprintf(msg, sizeof msg - 1, "%s.%s with these arguments was not compiled: ", d->ns, d->name);
+    for (int j = 0; j < n && len > 0 && len < (int)sizeof msg - 80; j++)
     {
-        NrClass* c = nr_classes[i];
-        if (!(c->flags & NR_GENERIC_INST) || c->n_gargs != n || c->image != d->image || strcmp(c->name, d->name) || strcmp(c->ns, d->ns)) continue;
-        int ok = 1;
-        for (int j = 0; j < n && ok; j++) ok = c->gargs[j] == K(adata(types)[j]);
-        if (ok) return nr_type_object(c);
+        NrClass* a = K(adata(types)[j]);
+        len += _snprintf(msg + len, sizeof msg - 1 - len, "%s%s.%s", j ? ", " : "", a->ns, a->name);
     }
-    char msg[300];
-    _snprintf(msg, sizeof msg, "%s.%s with these arguments was not compiled", d->ns, d->name);
     msg[sizeof msg - 1] = 0;
     nr_throw_notsupported(msg);
 }
