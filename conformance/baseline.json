@@ -1,14 +1,20 @@
 {
-  "passed": 9,
-  "total": 9,
+  "passed": 14,
+  "total": 15,
   "results": {
     "basics": "PASS",
     "collections": "PASS",
+    "culture": "FAIL (output)",
+    "decimals": "PASS",
+    "genident": "PASS",
+    "genreflect": "PASS",
     "hashing": "PASS",
     "interop": "PASS",
     "io": "PASS",
+    "nreloop": "PASS",
     "runtime": "PASS",
     "seh": "PASS",
+    "sockets": "PASS",
     "strings": "PASS",
     "structs": "PASS"
   }

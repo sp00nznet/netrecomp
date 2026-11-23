@@ -123,6 +123,35 @@ static int32_t ValueType_InternalGetHashCode(void* o, void** fields)
 
 /* ---- System.String ---- */
 
+/* Convert.FromBase64String / FromBase64CharArray (Chronicles' APlay socket protocol) */
+static void* b64_decode(const uint16_t* c, int32_t n)
+{
+    uint8_t* out = (uint8_t*)malloc((size_t)n * 3 / 4 + 3);
+    uint32_t acc = 0; int bits = 0, len = 0, pad = 0;
+    for (int32_t i = 0; i < n; i++)
+    {
+        uint16_t ch = c[i]; int v;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+        if (ch == '=') { pad++; continue; }
+        if (pad) v = -1;
+        else if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+        else if (ch == '+') v = 62;
+        else if (ch == '/') v = 63;
+        else v = -1;
+        if (v < 0) { free(out); nr_throw_new("System", "FormatException", "The input is not a valid Base-64 string"); }
+        acc = (acc << 6) | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[len++] = (uint8_t)(acc >> bits); }
+    }
+    if (pad > 2) { free(out); nr_throw_new("System", "FormatException", "The input is not a valid Base-64 string"); }
+    void* a = nr_newarr(nr_array_class(nr_class_by_name("System", "Byte"), 1), len);
+    memcpy(((NrArray*)a)->vector, out, (size_t)len);
+    free(out);
+    return a;
+}
+static void* Convert_InternalFromBase64String(NrString* s, uint8_t ws) { (void)ws; return b64_decode(s->chars, s->length); }
+static void* Convert_InternalFromBase64CharArray(NrArray* a, int32_t off, int32_t n) { return b64_decode((uint16_t*)a->vector + off, n); }
 static void* String_InternalAllocateStr(int32_t len) { return nr_str_alloc(len); }
 
 typedef struct Intern { NrString* s; struct Intern* next; } Intern;
@@ -579,10 +608,25 @@ static int32_t Marshal_GetLastWin32Error(void) { return (int32_t)GetLastError();
 static int32_t Marshal_SizeOf(void* t)
 {
     NrClass* k = nr_type_class(t);
+    for (int i = 0; i < nr_n_marshal_sizes; i++) if (nr_marshal_sizes[i].klass == k) return nr_marshal_sizes[i].size;
     return nr_value_size(k);
 }
 static intptr_t Marshal_UnsafeAddrOfPinnedArrayElement(void* arr, int32_t idx) { return (intptr_t)((char*)ARR(arr)->vector + (size_t)idx * OBJ(arr)->klass->elem_size); }
-static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del) { (void)del; NrClass* k = OBJ(o)->klass; memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj))); }
+static void Marshal_StructureToPtr(void* o, intptr_t p, uint8_t del)
+{
+    (void)del;
+    NrClass* k = OBJ(o)->klass;
+    memcpy((void*)p, (char*)o + sizeof(NrObj), (size_t)(k->flags & NR_VALUETYPE ? k->value_size : k->instance_size - (int32_t)sizeof(NrObj)));
+    /* delegate fields cross as function pointers (Steamworks.NET builds its callback vtable this way) */
+    for (int i = 0; i < k->n_fields; i++)
+    {
+        const NrFieldDesc* f = &k->fields[i];
+        if ((f->flags & 0x10) || !f->type || !(f->type->flags & NR_DELEGATE)) continue;
+        void** slot = (void**)((char*)p + f->offset - sizeof(NrObj));
+        void* d = *(void**)((char*)o + f->offset);
+        *slot = d ? nr_delegate_to_fnptr(d) : 0;
+    }
+}
 static void* Marshal_PtrToStructure(intptr_t p, void* t)
 {
     NrClass* k = nr_type_class(t);
@@ -649,6 +693,14 @@ static void Thread_SetCachedCurrentCulture(void* self, void* c) { thread_offsets
 static void* Thread_GetNull(void* self) { (void)self; return 0; }
 static void Thread_SetIgnore(void* self, void* v) { (void)self; (void)v; }
 static int32_t Thread_GetDomainID(void) { return 1; }
+/* No [MarshalAs] metadata is kept: report none (XmlSerializer asks for every field). */
+static void* FieldInfo_GetUnmanagedMarshal(void* self) { (void)self; return 0; }
+/* No machine.config is bundled: System.Configuration then reads the file from disk, or none. */
+static void* InternalConfigurationHost_get_bundled_machine_config(void) { return 0; }
+/* No version resources are read: FileVersionInfo keeps its empty defaults. */
+static void FileVersionInfo_GetVersionInfo_internal(void* self, void* file) { (void)self; (void)file; }
+/* Unity 4.6's corlib numbers managed threads itself (mono 2.6: ids start at 1) */
+static int32_t Thread_GetNewManagedId_internal(void) { static volatile LONG id; return InterlockedIncrement(&id); }
 static void Thread_Thread_free_internal(void* self, intptr_t h) { (void)self; if (h) CloseHandle((HANDLE)h); }
 static void Thread_Sleep_internal(int32_t ms) { Sleep(ms < 0 ? INFINITE : (DWORD)ms); }
 static void Thread_MemoryBarrier(void) { MemoryBarrier(); }
@@ -1163,8 +1215,24 @@ static void CompareInfo_construct_compareinfo(void* self, void* locale) { (void)
 static void CompareInfo_free_internal_collator(void* self) { (void)self; }
 static void CompareInfo_assign_sortkey(void* self, void* key, void* src, int32_t opts)
 {
-    (void)self; (void)key; (void)src; (void)opts;
-    nr_throw_notsupported("SortKey");
+    /* ordinal key, consistent with internal_compare: UTF-16 big endian, upper-cased
+     * under IgnoreCase (1), so byte order is code-point order */
+    (void)self;
+    NrString* str = (NrString*)src;
+    int n = str ? str->length : 0;
+    void* bytes = nr_newarr(nr_array_class(nr_k_byte, 1), n * 2);
+    uint8_t* b = (uint8_t*)((NrArray*)bytes)->vector;
+    for (int i = 0; i < n; i++)
+    {
+        uint16_t c = str->chars[i];
+        if ((opts & 1) && c >= 'a' && c <= 'z') c -= 32;
+        b[2 * i] = (uint8_t)(c >> 8); b[2 * i + 1] = (uint8_t)c;
+    }
+    NrClass* k = ((NrObj*)key)->klass;
+    const NrFieldDesc* fk = nr_field(k, "key");
+    const NrFieldDesc* fs = nr_field(k, "source");
+    if (fk) *(void**)((char*)key + fk->offset) = bytes;
+    if (fs) *(void**)((char*)key + fs->offset) = src;
 }
 
 /* Char tables come from the generated chartab.c (Unicode data, not mono's). */
@@ -1223,6 +1291,8 @@ static int32_t AppDomain_getDomainID(void* self) { (void)self; return 1; }
 /* ---- registration ---- */
 
 extern void nr_register_reflect_icalls(void);
+extern void nr_register_net_icalls(void);
+extern void nr_register_decimal_icalls(void);
 void nr_register_corlib_icalls2(void);
 
 static const NrIcall corlib[] = {
@@ -1233,6 +1303,8 @@ static const NrIcall corlib[] = {
     { "System.ValueType::InternalEquals", ValueType_InternalEquals },
     { "System.ValueType::InternalGetHashCode", ValueType_InternalGetHashCode },
     { "System.String::InternalAllocateStr", String_InternalAllocateStr },
+    { "System.Convert::InternalFromBase64String", Convert_InternalFromBase64String },
+    { "System.Convert::InternalFromBase64CharArray", Convert_InternalFromBase64CharArray },
     { "System.String::InternalIntern", String_InternalIntern },
     { "System.String::InternalIsInterned", String_InternalIsInterned },
     { "System.String::InternalSplit", String_InternalSplit },
@@ -1353,6 +1425,10 @@ static const NrIcall corlib[] = {
     { "System.Threading.Thread::GetSerializedCurrentUICulture", Thread_GetNull },
     { "System.Threading.Thread::SetSerializedCurrentUICulture", Thread_SetIgnore },
     { "System.Threading.Thread::GetDomainID", Thread_GetDomainID },
+    { "System.Reflection.FieldInfo::GetUnmanagedMarshal", FieldInfo_GetUnmanagedMarshal },
+    { "System.Diagnostics.FileVersionInfo::GetVersionInfo_internal", FileVersionInfo_GetVersionInfo_internal },
+    { "System.Configuration.InternalConfigurationHost::get_bundled_machine_config", InternalConfigurationHost_get_bundled_machine_config },
+    { "System.Threading.Thread::GetNewManagedId_internal", Thread_GetNewManagedId_internal },
     { "System.Threading.Thread::Thread_free_internal", Thread_Thread_free_internal },
     { "System.Threading.Thread::Sleep_internal", Thread_Sleep_internal },
     { "System.Threading.Thread::MemoryBarrier", Thread_MemoryBarrier },
@@ -1508,6 +1584,8 @@ void nr_register_corlib_icalls(void)
     (void)Path_GetTempPath_len;
     nr_register_icalls(corlib, (int)(sizeof corlib / sizeof corlib[0]));
     nr_register_reflect_icalls();
+    nr_register_net_icalls();
+    nr_register_decimal_icalls();
     nr_register_corlib_icalls2();
 }
 

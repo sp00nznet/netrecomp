@@ -108,8 +108,8 @@ sealed class MethodEmitter
         foreach (var h in body.ExceptionHandlers)
         {
             if (h.HandlerType == ExceptionHandlerType.Filter) throw new EmitError("filter block");
-            var b = blocks.FirstOrDefault(x => x.TryStart == h.TryStart.Offset && x.TryEnd == h.TryEnd.Offset);
-            if (b == null) blocks.Add(b = new Block { TryStart = h.TryStart.Offset, TryEnd = h.TryEnd.Offset });
+            var b = blocks.FirstOrDefault(x => x.TryStart == h.TryStart.Offset && x.TryEnd == (h.TryEnd?.Offset ?? body.CodeSize));
+            if (b == null) blocks.Add(b = new Block { TryStart = h.TryStart.Offset, TryEnd = (h.TryEnd?.Offset ?? body.CodeSize) });
             b.H.Add(h);
         }
         Analyse();
@@ -162,6 +162,9 @@ sealed class MethodEmitter
         }
     }
 
+    // Cecil leaves HandlerEnd null for a handler that runs to the end of the method.
+    int HEnd(ExceptionHandler h) => h.HandlerEnd?.Offset ?? body.CodeSize;
+
     void EmitRange(int start, int end, HashSet<Block> open)
     {
         var instrs = body.Instructions;
@@ -210,7 +213,7 @@ sealed class MethodEmitter
         if (hasFinally) o.Append($"ex{fin[0].HandlerStart.Offset} = 0;\n");
         o.Append("__try {\n");
         EmitRange(b.TryStart, b.TryEnd, inner);
-        if (hasFinally) o.Append($"X{b.TryStart:x4}:;\n");
+        if (hasFinally) o.Append($"X{b.TryStart:x4}_{b.TryEnd:x4}:;\n");
         o.Append("}\n");
         if (hasFinally)
         {
@@ -222,13 +225,13 @@ sealed class MethodEmitter
             var ev = $"ex{h.HandlerStart.Offset}";
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n}}\n");
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, open);
+            EmitRange(h.HandlerStart.Offset, HEnd(h), open);
             o.Append($"{finEnd[h]}:;\n    if ({ev}) nr_throw({ev});\n");
             if (leaves.TryGetValue(b, out var exits))
             {
                 var (so, sf) = (curOpen, curOff);
                 (curOpen, curOff) = (open, b.TryStart);
-                o.Append($"switch (lv{b.TryStart:x4}) {{\n");
+                o.Append($"switch (lv{b.TryStart:x4}_{b.TryEnd:x4}) {{\n");
                 for (int k = 0; k < exits.Count; k++) { o.Append($"case {k}:\n"); sp = 0; Goto(exits[k]); }
                 o.Append("}\n");
                 (curOpen, curOff) = (so, sf);
@@ -242,7 +245,7 @@ sealed class MethodEmitter
             o.Append($"__except (nr_catch(GetExceptionInformation(), 0, 0)) {{\n    {ev} = nr_caught(0);\n");
             finEnd[h] = $"F{h.HandlerStart.Offset:x4}";
             excVar.Push(ev);
-            EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
+            EmitRange(h.HandlerStart.Offset, HEnd(h), inner);
             excVar.Pop();
             o.Append($"{finEnd[h]}:;\n    nr_throw({ev});\n}}\n");
         }
@@ -263,7 +266,7 @@ sealed class MethodEmitter
                 // The handler's IL starts with the exception on the stack.
                 st = new[] { new SV(SK.P, null) }; sp = 1;
                 o.Append($"    s0p = {hv};\n"); vars["s0p"] = "void*";
-                EmitRange(h.HandlerStart.Offset, h.HandlerEnd.Offset, inner);
+                EmitRange(h.HandlerStart.Offset, HEnd(h), inner);
                 excVar.Pop();
             }
             o.Append("}\n}\n");
@@ -516,8 +519,8 @@ sealed class MethodEmitter
         if (!leaves.TryGetValue(b, out var exits)) leaves[b] = exits = new();
         int id = exits.IndexOf(t);
         if (id < 0) { exits.Add(t); id = exits.Count - 1; }
-        vars[$"lv{b.TryStart:x4}"] = "int32_t";
-        L($"lv{b.TryStart:x4} = {id}; goto X{b.TryStart:x4};");
+        vars[$"lv{b.TryStart:x4}_{b.TryEnd:x4}"] = "int32_t";
+        L($"lv{b.TryStart:x4}_{b.TryEnd:x4} = {id}; goto X{b.TryStart:x4}_{b.TryEnd:x4};");
     }
 
     // Joins where paths push different kinds of the same width (a fixed
@@ -802,6 +805,15 @@ sealed class MethodEmitter
         Push(Kind(t), $"*({lay.C(t)}*)nr_unbox({a.n}, &{g.Klass(t)})");
     }
 
+    void NeedDefaultCtor(TT t)
+    {
+        if (t.K != TK.Def || t.IsOpen || t.IsValueType || t.IsInterface || t.Def.IsAbstract) return;
+        var c = t.Def.Methods.FirstOrDefault(c => c.IsConstructor && !c.IsStatic && c.Parameters.Count == 0);
+        if (c == null) return;
+        g.Construct(t);
+        g.Need(w.Method(t, c, Array.Empty<TT>()));
+    }
+
     void Ldtoken(object operand)
     {
         switch (operand)
@@ -809,6 +821,9 @@ sealed class MethodEmitter
             case TypeReference tr:
             {
                 var t = w.Conv(tr, m.Owner.Args, m.MArgs);
+                // typeof(X) is how most code reaches Activator.CreateInstance(Type) (System.Configuration
+                // makes its InternalConfigurationSystem this way): compile X's default ctor.
+                NeedDefaultCtor(t);
                 var h = w.Cor("System", "RuntimeTypeHandle");
                 Push(Kind(h), $"(({lay.C(h)}){{ (intptr_t)nr_class_type(&{g.Klass(t)}) }})");
                 break;
@@ -844,6 +859,10 @@ sealed class MethodEmitter
         var mr = (MethodReference)ins.Operand;
         var t = w.ConvMethod(mr, m.Owner.Args, m.MArgs);
         if (t == null) { ArrayMethod(mr); return; }
+        // new T() compiles to Activator.CreateInstance<T>(), which finds T's default ctor by
+        // reflection: compile it (UnityEngine.UI's ListPool<T> makes List<Canvas> this way).
+        if (t.Def.Name == "CreateInstance" && t.Owner.Def.FullName == "System.Activator" && t.MArgs.Length == 1)
+            NeedDefaultCtor(t.MArgs[0]);
         var args = Args(t, t.Def.Parameters.Count);
         string? self = null;
         TT? selfT = null;

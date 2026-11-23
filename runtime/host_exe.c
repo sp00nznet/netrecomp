@@ -35,3 +35,6 @@ int main(void)
     fflush(stdout);
     return r;
 }
+
+/* NR_INPUT "shot" needs Unity; a standalone exe has no frame to save. */
+void nr_shot_take(const char* path) { (void)path; }

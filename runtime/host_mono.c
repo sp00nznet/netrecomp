@@ -13,6 +13,7 @@
  *   MonoObject*, MonoString*, ...  the objects themselves (mono layout)
  * See docs/unity-host.md. */
 #include "nrrt.h"
+#include <intrin.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 
@@ -74,7 +75,8 @@ static void ensure_init(void)
 API NrDomain* mono_jit_init(const char* file) { TR("mono_jit_init"); (void)file; ensure_init(); return &root_domain; }
 void nr_input_start(void);
 void nr_mute_start(void);
-API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); return &root_domain; }
+static DWORD shot_thread;     /* main thread, for NR_INVSTAT */
+API NrDomain* mono_jit_init_version(const char* name, const char* ver) { TR("mono_jit_init_version"); (void)name; (void)ver; ensure_init(); nr_input_start(); nr_mute_start(); shot_thread = GetCurrentThreadId(); return &root_domain; }
 API void mono_jit_cleanup(NrDomain* d) { TR("mono_jit_cleanup"); (void)d; }
 API int mono_jit_exec(NrDomain* d, NrImage* a, int argc, char** argv) { TR("mono_jit_exec"); (void)d; (void)a; (void)argc; (void)argv; return 0; }
 API void mono_jit_parse_options(int argc, char** argv) { TR("mono_jit_parse_options"); (void)argc; (void)argv; }
@@ -262,8 +264,20 @@ API NrClass* mono_class_from_name_case(NrImage* img, const char* ns, const char*
     }
     return 0;
 }
-API const char* mono_class_get_name(NrClass* k) { TR("mono_class_get_name"); return k->name; }
-API const char* mono_class_get_namespace(NrClass* k) { TR("mono_class_get_namespace"); return k->ns; }
+/* Unity sometimes hands over a class pointer read from a dead or foreign object;
+   log it (and who asked) instead of faulting inside the player. */
+static int bad_class(NrClass* k, const char* what, void* ra)
+{
+    __try { if (k && k->self == k) return 0; } __except (1) { }
+    HMODULE mod = 0; char mn[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ra, &mod)) GetModuleFileNameA(mod, mn, MAX_PATH);
+    const char* is = "";
+    __try { NrClass* ok = k && GC_base(k) ? ((NrObj*)k)->klass : 0; if (ok && ok->self == ok) is = ok->name; } __except (1) { }
+    nr_log("netrecomp: %s(%p): not a class (%s %s), called from %s+0x%llx\n", what, (void*)k, *is ? "an object of" : "base", *is ? is : (k && GC_base(k) ? "gc" : "non-gc"), mn, (unsigned long long)((char*)ra - (char*)mod));
+    return 1;
+}
+API const char* mono_class_get_name(NrClass* k) { TR("mono_class_get_name"); return bad_class(k, "mono_class_get_name", _ReturnAddress()) ? "" : k->name; }
+API const char* mono_class_get_namespace(NrClass* k) { TR("mono_class_get_namespace"); return bad_class(k, "mono_class_get_namespace", _ReturnAddress()) ? "" : k->ns; }
 API NrClass* mono_class_get_parent(NrClass* k) { TR("mono_class_get_parent"); return (k->flags & NR_INTERFACE) ? 0 : k->parent; }
 API NrImage* mono_class_get_image(NrClass* k) { TR("mono_class_get_image"); return k->image; }
 API uint32_t mono_class_get_flags(NrClass* k) { TR("mono_class_get_flags"); return k->attrs; }
@@ -486,12 +500,53 @@ API void mono_runtime_object_init(void* o)
 }
 
 void nr_input_main_tick(void);
+/* Class records are static data in this image. Unity 4.6 sometimes passes a receiver that is
+   not a managed object (its first word points into the player), so check before dispatching. */
+extern IMAGE_DOS_HEADER __ImageBase;
+static int in_image(const void* p)
+{
+    const char* b = (const char*)&__ImageBase;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + __ImageBase.e_lfanew);
+    return (const char*)p >= b && (const char*)p < b + nt->OptionalHeader.SizeOfImage;
+}
+
+/* NR_INVSTAT: every 30 s, the methods the player invoked most on its main thread */
+static int invstat_on = -1;
+static struct { const NrMethodDesc* m; int n, threw; } invstat[512];
+static ULONGLONG invstat_t;
+static void invstat_note(const NrMethodDesc* m, int threw)
+{
+    if (invstat_on < 0) invstat_on = GetEnvironmentVariableA("NR_INVSTAT", 0, 0) > 0;
+    if (!invstat_on || !m || GetCurrentThreadId() != shot_thread) return;
+    unsigned h = (unsigned)(((uintptr_t)m >> 4) * 2654435761u) % 512;
+    for (int i = 0; i < 512; i++, h = (h + 1) % 512)
+        if (!invstat[h].m || invstat[h].m == m) { invstat[h].m = m; invstat[h].n++; invstat[h].threw += threw; break; }
+    ULONGLONG now = GetTickCount64();
+    if (!invstat_t) invstat_t = now;
+    if (now - invstat_t < 30000) return;
+    invstat_t = now;
+    nr_log("netrecomp: invstat (30 s):\n");
+    for (int k = 0; k < 25; k++)
+    {
+        int b = -1;
+        for (int i = 0; i < 512; i++) if (invstat[i].m && invstat[i].n > 0 && (b < 0 || invstat[i].n > invstat[b].n)) b = i;
+        if (b < 0) break;
+        nr_log("  %7d %s.%s::%s%s\n", invstat[b].n, invstat[b].m->klass->ns, invstat[b].m->klass->name, invstat[b].m->name, invstat[b].threw ? " (threw)" : "");
+        invstat[b].n = -invstat[b].n;
+    }
+    memset(invstat, 0, sizeof invstat);
+}
+
 API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, void** exc)
 {
     TR("mono_runtime_invoke");
     nr_input_main_tick();
     if (!m) { if (exc) *exc = 0; return 0; }
+    /* like mono: an abstract/interface method runs the receiver's override
+       (Unity 4.5+ calls ISerializationCallbackReceiver this way) */
+    if (obj && (m->flags & 0x400) && in_image(*(void**)obj)) m = mono_object_get_virtual_method(obj, m);
     void* r = nr_invoke(m, obj, params, exc);
+    invstat_note(m, exc && *exc);
     if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
     return r;
 }

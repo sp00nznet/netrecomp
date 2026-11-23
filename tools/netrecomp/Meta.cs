@@ -16,11 +16,49 @@ sealed class MetaWriter
 
     public MetaWriter(Gen g) { this.g = g; w = g.W; lay = g.Lay; }
 
+    // Native (marshaled) size and alignment of a sequential struct; 0 when it can't be worked out.
+    int NativeSize(TT t) { try { return NativeStruct(t, 0).size; } catch (Exception) { return 0; } }
+    (int size, int align) NativeStruct(TT t, int depth)
+    {
+        if (depth > 8) throw new InvalidOperationException("nested too deep");
+        int pack = t.Def.PackingSize > 0 ? t.Def.PackingSize : 8, off = 0, max = 1;
+        bool ansi = !t.Def.IsUnicodeClass;
+        foreach (var f in t.Def.Fields.Where(f => !f.IsStatic))
+        {
+            var (fs, fa) = NativeField(w.FieldType(t, f), f.MarshalInfo, ansi, depth);
+            fa = Math.Min(fa, pack); max = Math.Max(max, fa);
+            off = (off + fa - 1) / fa * fa + fs;
+        }
+        int size = Math.Max((off + max - 1) / max * max, t.Def.ClassSize > 0 ? t.Def.ClassSize : 0);
+        return (Math.Max(size, 1), max);
+    }
+    (int size, int align) NativeField(TT ft, MarshalInfo? mi, bool ansi, int depth)
+    {
+        if (mi is FixedArrayMarshalInfo fa && ft.K == TK.SzArray)
+        {
+            var (es, ea) = NativeField(ft.Elem, null, ansi, depth);
+            return (es * Math.Max(fa.Size, 1), ea);
+        }
+        if (mi is FixedSysStringMarshalInfo fss) return (fss.Size * (ansi ? 1 : 2), ansi ? 1 : 2);
+        if (ft.K != TK.Def || !ft.IsValueType) return (4, 4);   // references and pointers: x86
+        if (ft.Def.IsEnum) return NativeField(w.FieldType(ft, ft.Def.Fields.First(f => !f.IsStatic)), null, ansi, depth);
+        switch (ft.Def.FullName)
+        {
+            case "System.Boolean": return mi?.NativeType is NativeType.I1 or NativeType.U1 ? (1, 1) : (4, 4);
+            case "System.Char": return ansi && mi?.NativeType is not (NativeType.I2 or NativeType.U2) ? (1, 1) : (2, 2);
+            case "System.SByte": case "System.Byte": return (1, 1);
+            case "System.Int16": case "System.UInt16": return (2, 2);
+            case "System.Int32": case "System.UInt32": case "System.Single": case "System.IntPtr": case "System.UIntPtr": return (4, 4);
+            case "System.Int64": case "System.UInt64": case "System.Double": return (8, 8);
+        }
+        return NativeStruct(ft, depth + 1);
+    }
+
     static bool Real(TT t) => t.K != TK.Def || t.Def != null;
 
     public void Close()
     {
-        foreach (var m in g.Order) { if (!methodsOf.TryGetValue(m.Owner, out var l)) methodsOf[m.Owner] = l = new(); l.Add(m); }
+        foreach (var m in g.Order.Concat(g.Gvms.Keys).Concat(g.ReflectInst).Distinct()) { if (!methodsOf.TryGetValue(m.Owner, out var l)) methodsOf[m.Owner] = l = new(); l.Add(m); }
         var work = new Queue<TT>(g.KlassUsed.Concat(g.Constructed).Concat(g.ObjUsed).Concat(g.StaticsUsed));
         var seen = new HashSet<TT>();
         while (work.Count > 0)
@@ -38,6 +76,7 @@ sealed class MetaWriter
                 if (t.K is TK.SzArray or TK.Array or TK.Ptr or TK.ByRef) Add(t.Elem);
                 foreach (var (i, _) in L.Ifaces) Add(i);
                 foreach (var a in t.Args) Add(a);
+                if (t.K == TK.Def && t.Args.Length > 0) Add(w.Inst(t.Def, Array.Empty<TT>()));   // GetGenericTypeDefinition
                 if (t.IsEnum) Add(lay.EnumBase(t));
                 if (t.K == TK.Def && !t.IsOpen)
                     foreach (var f in t.Def.Fields) Add(Strip(w.FieldType(t, f)));
@@ -57,12 +96,17 @@ sealed class MetaWriter
                 foreach (var md in t.Def.Methods)
                     if (!md.HasGenericParameters) list.Add(w.Method(t, md, Array.Empty<TT>()));
                 if (methodsOf.TryGetValue(t, out var extra)) foreach (var x in extra) if (!list.Contains(x)) list.Add(x);
+                // generic method definitions last (name lookups find real methods first);
+                // reflection's MakeGenericMethod picks among the compiled instances above
+                foreach (var md in t.Def.Methods)
+                    if (md.HasGenericParameters) { var d = new MI { Owner = t, Def = md, Key = t.Key + "::" + md.Name + "<def>" + md.MetadataToken.ToUInt32() }; gdefs.Add(d); list.Add(d); }
             }
             for (int i = 0; i < list.Count; i++) descIndex[list[i]] = (t.Id, i);
             mlists[t] = list;
         }
     }
     readonly Dictionary<TT, List<MI>> mlists = new();
+    readonly HashSet<MI> gdefs = new();
 
     TT Strip(TT t) => t.K == TK.ByRef ? t.Elem : t;
     string K(TT t) => "K" + lay.Id(t);
@@ -290,6 +334,16 @@ sealed class MetaWriter
         foreach (var t in classes) sb.Append($"    &K{t.Id},\n");
         sb.Append($"}};\nconst int32_t nr_n_classes = {classes.Count};\n\n");
 
+        // Marshal.SizeOf: structs whose native layout differs from the managed one
+        // ([MarshalAs] arrays and strings, 4-byte BOOL, ANSI char). Steamworks.NET's
+        // Packsize.Test checks one of these before SteamAPI.Init.
+        var ms = classes.Where(t => t.K == TK.Def && t.IsValueType && !t.Def.IsEnum && !t.Def.IsExplicitLayout && !t.IsOpen
+                                    && t.Def.Fields.Any(f => !f.IsStatic && (f.HasMarshalInfo || f.FieldType.FullName is "System.Boolean" or "System.Char")))
+                        .Select(t => (t, n: NativeSize(t))).Where(x => x.n > 0).ToList();
+        sb.Append("const NrMarshalSize nr_marshal_sizes[] = {\n");
+        foreach (var (t, n) in ms) sb.Append($"    {{ &K{t.Id}, {n} }},\n");
+        sb.Append($"    {{ 0, 0 }}\n}};\nconst int32_t nr_n_marshal_sizes = {ms.Count};\n\n");
+
         // GVM tables
         foreach (var kv in g.Gvms)
         {
@@ -398,10 +452,15 @@ sealed class MetaWriter
                 }
             }
             catch (Exception e) when (e is UnresolvedGeneric or KeyNotFoundException) { ret = "0"; }
+            if (gdefs.Contains(m))
+            {
+                ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", 0, 0, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, -1, 0, 0, 0, 0x{m.Def.MetadataToken.ToUInt32():x}, 0, 0, 0, {m.Def.GenericParameters.Count} }}");
+                continue;
+            }
             int slot = m.Def.IsVirtual && L.SlotOf.TryGetValue(m.Def, out var s) ? s : -1;
             var fn = live ? $"(void*){g.NameOf(m)}" : "0";
             var invk = live ? Invoker(m) : "0";
-            ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", {fn}, {invk}, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, {slot}, {ret}, {pars}, {pby}, 0x{m.Def.MetadataToken.ToUInt32():x}, {(m.MArgs.Length == 0 ? g.At.Table(t, m.Def, KRef) : "0, 0")} }}");
+            ml.Add($"{{ &K{id}, \"{Gen.CEsc(m.Def.Name)}\", {fn}, {invk}, {(ushort)m.Def.Attributes}, {(ushort)m.Def.ImplAttributes}, {m.Def.Parameters.Count}, {slot}, {ret}, {pars}, {pby}, 0x{m.Def.MetadataToken.ToUInt32():x}, {(m.MArgs.Length == 0 ? g.At.Table(t, m.Def, KRef) : "0, 0")}{(m.MArgs.Length == 0 ? "" : $", (NrClass* const[]){{ {string.Join(", ", m.MArgs.Select(KRef))} }}, {m.MArgs.Length}")} }}");
         }
         sb.Append($"const NrMethodDesc ML{id}[] = {{\n    {string.Join(",\n    ", ml.DefaultIfEmpty("{ 0 }"))} }};\n");
 

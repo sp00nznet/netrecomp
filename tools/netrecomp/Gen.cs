@@ -98,6 +98,46 @@ sealed class Gen
         Name(m);
         queue.Enqueue(m);
         AotHints(m);
+        ReflectGenerics(m);
+    }
+
+    // typeof(X).GetMethod("Name") ... MakeGenericMethod(runtime types): the arguments are
+    // only known at run time, so each generic method Name on X gets a canonical instance
+    // (object, or the class constraint, per parameter) that reflection hands out for any
+    // reference-type arguments. Abstract and interface targets go through the generic
+    // virtual machinery, so every constructed implementer gets the same instance.
+    public readonly List<MI> ReflectInst = new();
+    void ReflectGenerics(MI m)
+    {
+        if (!m.Def.HasBody) return;
+        var ins = m.Def.Body.Instructions;
+        if (!ins.Any(i => i.Operand is MethodReference r && r.Name == "MakeGenericMethod" && r.DeclaringType.Name is "MethodInfo" or "MonoMethod")) return;
+        var names = ins.Where(i => i.OpCode.Code == Code.Ldstr).Select(i => (string)i.Operand).ToHashSet();
+        foreach (var tr in ins.Where(i => i.OpCode.Code == Code.Ldtoken && i.Operand is TypeReference).Select(i => (TypeReference)i.Operand))
+        {
+            TT t;
+            try { t = W.Conv(tr, m.Owner.Args, m.MArgs); } catch (UnresolvedGeneric) { continue; }
+            if (t.K != TK.Def || t.IsOpen) continue;
+            foreach (var md in t.Def.Methods.Where(x => x.HasGenericParameters && names.Contains(x.Name)))
+            {
+                var args = new TT[md.GenericParameters.Count];
+                bool ok = true;
+                for (int i = 0; i < args.Length && ok; i++)
+                {
+                    var gp = md.GenericParameters[i];
+                    if (gp.HasNotNullableValueTypeConstraint) { ok = false; break; }
+                    var cls = gp.Constraints.Select(c => c.ConstraintType).FirstOrDefault(c => W.Resolve(c) is { IsInterface: false } d && !d.IsValueType);
+                    try { args[i] = cls != null ? W.Conv(cls, t.Args, Array.Empty<TT>()) : W.Cor("System", "Object"); } catch (UnresolvedGeneric) { ok = false; }
+                }
+                if (!ok) continue;
+                var inst = W.Method(t, md, args);
+                if (ReflectInst.Contains(inst)) continue;
+                ReflectInst.Add(inst);
+                Klass(t);
+                if (md.IsAbstract) Gvm(inst); else Need(inst);
+                if (Environment.GetEnvironmentVariable("NR_TRACE") != null) Console.Error.WriteLine($"reflect generic: {inst.Key} (from {m.Key})");
+            }
+        }
     }
 
     // Instantiations the class library makes by reflection (MakeGenericType on
@@ -132,13 +172,39 @@ sealed class Gen
         Klass(t);
         var L = Lay.Full(t);
         if (t.K is TK.SzArray or TK.Array) Construct(t.Elem.IsValueType ? t.Elem : t.Elem);
+        Canonical(t);
         foreach (var s in L.Slots) if (s != null && !s.Def.IsAbstract) Need(s);
         foreach (var (_, impls) in L.Ifaces) foreach (var s in impls) if (s != null && !s.Def.IsAbstract) Need(s);
         if (t.K == TK.Def)
         {
             var cc = t.Def.Methods.FirstOrDefault(x => x.IsConstructor && x.IsStatic);
             if (cc != null) Need(W.Method(t, cc, Array.Empty<TT>()));
+            // Marshal.StructureToPtr turns delegate fields of interop layouts into function
+            // pointers (Steamworks.NET's CCallbackBaseVTable), so those delegates need thunks.
+            if (!t.Def.IsAutoLayout)
+                foreach (var f in t.Def.Fields.Where(f => !f.IsStatic))
+                {
+                    var ft = W.FieldType(t, f);
+                    if (IsDelegate(ft)) RevPool(ft, quiet: true);   // managed-only structs hold delegates too
+                }
         }
+    }
+
+    // Reflection can call any public method of a constructed generic instance; the runtime
+    // runs those on the canonical instance (object for each reference-type argument),
+    // so that one gets its public methods compiled. ponytail: public instance methods only.
+    void Canonical(TT t)
+    {
+        if (t.K != TK.Def || t.Args.Length == 0 || t.IsOpen || t.IsInterface || t.IsValueType) return;
+        var obj = W.Cor("System", "Object");
+        if (!t.Args.Any(a => a.IsRef && a != obj)) return;
+        TT c;
+        try { c = W.Inst(t.Def, t.Args.Select(a => a.IsRef ? obj : a).ToArray()); } catch (UnresolvedGeneric) { return; }
+        if (c == t) return;
+        Construct(c);
+        foreach (var md in c.Def.Methods)
+            if (md.IsPublic && !md.IsStatic && !md.HasGenericParameters && !md.IsAbstract && (md.HasBody || md.IsInternalCall || md.IsRuntime))
+                Need(W.Method(c, md, Array.Empty<TT>()));
     }
 
     public bool HasCctor(TT t) => t.K == TK.Def && !t.IsOpen && t.Def.Methods.Any(x => x.IsConstructor && x.IsStatic);
@@ -220,6 +286,31 @@ sealed class Gen
     // ---- driver ----
     public void Root(MI m) => Need(m);
 
+    // A game's generic class can be built from data alone (a serializer reads
+    // "Ns.Cost`1[[Ns.Params, Asm]]" and calls its default constructor). Each such class
+    // gets its canonical instance (object for every parameter) with that constructor, which
+    // Type.GetType hands out for any reference-type arguments.
+    public void RootDataGenerics(TypeDefinition d)
+    {
+        if (!d.HasGenericParameters || d.IsAbstract || d.IsInterface || d.IsValueType) return;
+        if (d.GenericParameters.Any(p => p.HasNotNullableValueTypeConstraint)) return;
+        var ctor = d.Methods.FirstOrDefault(x => x.IsConstructor && !x.IsStatic && x.Parameters.Count == 0);
+        if (ctor == null) return;
+        TT t;
+        try
+        {
+            // object, or the parameter's class constraint
+            t = W.Inst(d, d.GenericParameters.Select(p =>
+            {
+                var cls = p.Constraints.Select(c => c.ConstraintType).FirstOrDefault(c => !c.ContainsGenericParameter && W.Resolve(c) is { IsInterface: false } r && !r.IsValueType);
+                return cls != null ? W.Conv(cls, Array.Empty<TT>(), Array.Empty<TT>()) : W.Cor("System", "Object");
+            }).ToArray());
+        }
+        catch (Exception e) when (e is UnresolvedGeneric or InvalidOperationException) { return; }
+        Construct(t);
+        Need(W.Method(t, ctor, Array.Empty<TT>()));
+    }
+
     public void Run()
     {
         int gvmSeen = 0;
@@ -281,6 +372,14 @@ sealed class Gen
             if (d.IsPInvokeImpl) { Pinvokes++; var s = PInvoke(m); Ok++; return s; }
             if (d.IsRuntime && IsDelegate(m.Owner)) { Ok++; return DelegateMethod(m); }
             if (!d.HasBody) { if (d.IsAbstract) return ""; throw new EmitError("no body"); }
+            // Unity 4.6's corlib builds a Getter<T,R> delegate by MakeGenericType per property;
+            // the general GetValue overload does the same through Invoke, with no instantiation.
+            if (d.Name == "GetValue" && d.Parameters.Count == 2 && m.Owner.Def.FullName == "System.Reflection.MonoProperty")
+            {
+                var full = m.Owner.Def.Methods.First(x => x.Name == "GetValue" && x.Parameters.Count == 5);
+                Ok++;
+                return $"{Proto(m)}\n{{\n    return {Fn(W.Method(m.Owner, full, Array.Empty<TT>()))}(a0, a1, 0, 0, a2, 0);\n}}\n";
+            }
             var c = new MethodEmitter(this, m).Emit();
             Ok++;
             return c;
@@ -480,14 +579,17 @@ sealed class Gen
         var ips = Params(inv).Skip(1).ToList();
         var id = Name(m)[1..];
         var sb = new StringBuilder();
-        sb.Append($"typedef struct BI{id} {{ void* d; void* cb; {string.Concat(ips.Select((c, i) => $"{c} a{i + 1}; "))}}} BI{id};\n");
+        sb.Append($"typedef struct BI{id} {{ void* d; void* cb; {string.Concat(ips.Select((c, i) => $"{c} a{i + 1}; "))}void* st; }} BI{id};\n");
         sb.Append($"static void BW{id}(void* p)\n{{\n    BI{id}* c = (BI{id}*)p;\n");
+        // mono's IO thread pool does a socket async call's recv/send itself, then runs
+        // the worker (Socket/Worker.Receive and Send only complete the result)
+        if (m.Owner.Def.FullName == "System.Net.Sockets.Socket/SocketAsyncCall") sb.Append($"    nr_socket_aio(c->st);\n");
         sb.Append($"    {Name(inv)}({string.Join(", ", ips.Select((_, i) => $"c->a{i + 1}").Prepend("c->d"))});\n");
         sb.Append("    if (c->cb) nr_async_callback(c->cb);\n}\n");
         sb.Append(Proto(m)).Append("\n{\n");
         sb.Append($"    BI{id}* c = (BI{id}*)nr_alloc_root(sizeof(BI{id}));\n    c->d = a0;\n");
         for (int i = 0; i < ips.Count; i++) sb.Append($"    c->a{i + 1} = a{i + 1};\n");
-        sb.Append($"    c->cb = a{ips.Count + 1};\n    nr_async_start(BW{id}, c);\n    return 0;\n}}\n");
+        sb.Append($"    c->cb = a{ips.Count + 1};\n    c->st = a{ips.Count + 2};\n    nr_async_start(BW{id}, c);\n    return 0;\n}}\n");
         return sb.ToString();
     }
 
@@ -600,11 +702,16 @@ sealed class Gen
     // delegate instance through a GC handle (nr_delegate_to_fnptr).
     public const int RevPoolSize = 32;
     public readonly Dictionary<TT, string> RevPools = new();
-    void RevPool(TT d)
+    void RevPool(TT d, bool quiet = false)
     {
         if (RevPools.ContainsKey(d)) return;
         Klass(d);
         var inv = W.Method(d, d.Def.Methods.First(x => x.Name == "Invoke"), Array.Empty<TT>());
+        // A delegate whose signature can't cross (StringBuilder, struct by value...) gets no pool:
+        // marshaling it then fails at run time instead of failing the whole lift.
+        var bad = Enumerable.Range(0, inv.Def.Parameters.Count).Select(i => W.ParamType(inv, i))
+            .FirstOrDefault(pt => !(pt.K == TK.ByRef || Blittable(pt) || pt.K == TK.Def && pt.Def.FullName is "System.String" or "System.Boolean"));
+        if (bad != null) { if (quiet) return; var why = "reverse P/Invoke parameter " + bad.Key; Failures[why] = Failures.GetValueOrDefault(why) + 1; return; }
         Need(inv);
         RevPools[d] = "";
     }
