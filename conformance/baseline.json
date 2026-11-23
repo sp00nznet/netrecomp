@@ -1,6 +1,6 @@
 {
-  "passed": 14,
-  "total": 15,
+  "passed": 15,
+  "total": 16,
   "results": {
     "basics": "PASS",
     "collections": "PASS",
@@ -11,6 +11,7 @@
     "hashing": "PASS",
     "interop": "PASS",
     "io": "PASS",
+    "netpolicy": "PASS",
     "nreloop": "PASS",
     "runtime": "PASS",
     "seh": "PASS",

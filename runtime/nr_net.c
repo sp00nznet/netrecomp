@@ -3,8 +3,10 @@
  * A SocketAddress is its byte[] "data": family (2 bytes, little endian), then the rest
  * of a sockaddr, which is exactly WinSock's layout.
  *
- * NR_NET_ALLOW=<ipv4>[,<ipv4>...] limits connect/sendto to those addresses (automated
- * runs set it to 127.0.0.1 so nothing leaves the machine). */
+ * Network policy (fails closed): connect/sendto/DNS reach loopback only, unless
+ * NR_NET_ALLOW=<ipv4>[,<ipv4>...] names more addresses; "dns" in that list allows name
+ * lookups. It is enforced for managed sockets here and for the whole process (the
+ * native player, plugins, WinINet) by patching ws2_32 imports, see nr_net_guard_start. */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "nrrt.h"
@@ -36,19 +38,43 @@ static int sa_get(void* o, struct sockaddr_storage* ss)
     return n;
 }
 
-static int allowed(const struct sockaddr* a)
+static int is_loopback(const struct sockaddr* a)
 {
-    const char* allow = getenv("NR_NET_ALLOW");
-    if (!allow || !*allow) return 1;
-    if (a->sa_family != AF_INET) return 0;
-    char ip[64];
-    inet_ntop(AF_INET, &((const struct sockaddr_in*)a)->sin_addr, ip, sizeof ip);
-    size_t n = strlen(ip);
-    for (const char* p = allow; (p = strstr(p, ip)); p += n)
-        if ((p == allow || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) return 1;
-    nr_log("netrecomp: blocked connection to %s (NR_NET_ALLOW)\n", ip);
+    if (a->sa_family == AF_INET) return (ntohl(((const struct sockaddr_in*)a)->sin_addr.s_addr) >> 24) == 127;
+    if (a->sa_family == AF_INET6) return IN6_IS_ADDR_LOOPBACK(&((const struct sockaddr_in6*)a)->sin6_addr);
     return 0;
 }
+static int in_allow_list(const char* word)
+{
+    const char* allow = getenv("NR_NET_ALLOW");
+    size_t n = strlen(word);
+    if (!allow || !n) return 0;
+    for (const char* p = allow; (p = strstr(p, word)); p += n)
+        if ((p == allow || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) return 1;
+    return 0;
+}
+/* loopback always; anything else only when NR_NET_ALLOW lists it */
+int nr_net_allowed(const struct sockaddr* a)
+{
+    if (!a || a->sa_family == AF_UNSPEC || is_loopback(a)) return 1;
+    char ip[64] = "?";
+    if (a->sa_family == AF_INET) inet_ntop(AF_INET, &((const struct sockaddr_in*)a)->sin_addr, ip, sizeof ip);
+    else if (a->sa_family == AF_INET6) inet_ntop(AF_INET6, &((const struct sockaddr_in6*)a)->sin6_addr, ip, sizeof ip);
+    if (in_allow_list(ip)) return 1;
+    nr_log("netrecomp: blocked connection to %s (network policy; NR_NET_ALLOW)\n", ip);
+    return 0;
+}
+/* a name may be looked up when it is "localhost", a literal allowed address, or NR_NET_ALLOW has "dns" */
+static int name_allowed(const char* h)
+{
+    if (!h || !*h || !_stricmp(h, "localhost") || in_allow_list("dns")) return 1;
+    struct sockaddr_in a4 = { 0 }; struct sockaddr_in6 a6 = { 0 };
+    if (inet_pton(AF_INET, h, &a4.sin_addr) == 1) { a4.sin_family = AF_INET; return nr_net_allowed((struct sockaddr*)&a4); }
+    if (inet_pton(AF_INET6, h, &a6.sin6_addr) == 1) { a6.sin6_family = AF_INET6; return nr_net_allowed((struct sockaddr*)&a6); }
+    nr_log("netrecomp: blocked lookup of %s (network policy; NR_NET_ALLOW=dns allows it)\n", h);
+    return 0;
+}
+static int allowed(const struct sockaddr* a) { return nr_net_allowed(a); }
 
 #define ERR(e) (*(e) = WSAGetLastError())
 
@@ -267,6 +293,7 @@ static uint8_t Dns_GetHostByName_internal(void* host, void** h_name, void** alia
 {
     wsa();
     char* h = nr_utf8(host);
+    if (!name_allowed(h)) { nr_free(h); return 0; }
     struct addrinfo hints = { 0 }, *res = 0;
     hints.ai_family = AF_INET;   /* mono 2.0 callers expect IPv4 first; IPv6 off by default */
     hints.ai_flags = AI_CANONNAME;
@@ -367,4 +394,94 @@ void nr_register_net_icalls(void)
     };
 #undef S
     nr_register_icalls(t, (int)(sizeof t / sizeof t[0]));
+}
+
+/* ---- process-wide guard ----
+ * Every module's import slots that point at ws2_32's connect/sendto/resolver entry
+ * points are redirected to policy-checking wrappers, so the native player and its
+ * plugins obey the same policy as managed code. Modules loaded later are picked up
+ * by a rescan every 2 s and after each P/Invoke library load.
+ * ponytail: calls through GetProcAddress (not imports) aren't seen; hook those
+ * entry points inline if a title resolves WinSock dynamically. */
+#include <tlhelp32.h>
+typedef int (WSAAPI* connect_t)(SOCKET, const struct sockaddr*, int);
+typedef int (WSAAPI* wsaconnect_t)(SOCKET, const struct sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
+typedef int (WSAAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
+typedef int (WSAAPI* wsasendto_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI* gai_t)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
+typedef int (WSAAPI* gaiw_t)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
+typedef struct hostent* (WSAAPI* ghbn_t)(const char*);
+static connect_t r_connect; static wsaconnect_t r_wsaconnect; static sendto_t r_sendto; static wsasendto_t r_wsasendto;
+static gai_t r_gai; static gaiw_t r_gaiw; static ghbn_t r_ghbn;
+
+static int WSAAPI g_connect(SOCKET s, const struct sockaddr* a, int n) { if (!nr_net_allowed(a)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; } return r_connect(s, a, n); }
+static int WSAAPI g_wsaconnect(SOCKET s, const struct sockaddr* a, int n, LPWSABUF c, LPWSABUF e, LPQOS q, LPQOS g) { if (!nr_net_allowed(a)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; } return r_wsaconnect(s, a, n, c, e, q, g); }
+static int WSAAPI g_sendto(SOCKET s, const char* b, int l, int f, const struct sockaddr* a, int n) { if (a && !nr_net_allowed(a)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; } return r_sendto(s, b, l, f, a, n); }
+static int WSAAPI g_wsasendto(SOCKET s, LPWSABUF b, DWORD c, LPDWORD sent, DWORD f, const struct sockaddr* a, int n, LPWSAOVERLAPPED o, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) { if (a && !nr_net_allowed(a)) { WSASetLastError(WSAEACCES); return SOCKET_ERROR; } return r_wsasendto(s, b, c, sent, f, a, n, o, cr); }
+static int WSAAPI g_gai(PCSTR h, PCSTR sv, const ADDRINFOA* hi, PADDRINFOA* r) { if (!name_allowed(h)) return WSAHOST_NOT_FOUND; return r_gai(h, sv, hi, r); }
+static int WSAAPI g_gaiw(PCWSTR h, PCWSTR sv, const ADDRINFOW* hi, PADDRINFOW* r)
+{
+    char n[512] = "";
+    if (h) WideCharToMultiByte(CP_UTF8, 0, h, -1, n, sizeof n, 0, 0);
+    if (h && !name_allowed(n)) return WSAHOST_NOT_FOUND;
+    return r_gaiw(h, sv, hi, r);
+}
+static struct hostent* WSAAPI g_ghbn(const char* h) { if (!name_allowed(h)) { WSASetLastError(WSAHOST_NOT_FOUND); return 0; } return r_ghbn(h); }
+
+static void patch_module(HMODULE m)
+{
+    const struct { void* real; void* wrap; } map[] = {
+        { (void*)r_connect, (void*)g_connect }, { (void*)r_wsaconnect, (void*)g_wsaconnect },
+        { (void*)r_sendto, (void*)g_sendto }, { (void*)r_wsasendto, (void*)g_wsasendto },
+        { (void*)r_gai, (void*)g_gai }, { (void*)r_gaiw, (void*)g_gaiw }, { (void*)r_ghbn, (void*)g_ghbn } };
+    char* b = (char*)m;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)b;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir->VirtualAddress) return;
+    for (IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(b + dir->VirtualAddress); d->Name; d++)
+        for (IMAGE_THUNK_DATA* t = (IMAGE_THUNK_DATA*)(b + d->FirstThunk); t->u1.Function; t++)
+            for (int i = 0; i < (int)(sizeof map / sizeof map[0]); i++)
+                if (map[i].real && (void*)t->u1.Function == map[i].real)
+                {
+                    DWORD old;
+                    if (VirtualProtect(&t->u1.Function, sizeof(void*), PAGE_READWRITE, &old))
+                    {
+                        t->u1.Function = (ULONG_PTR)map[i].wrap;
+                        VirtualProtect(&t->u1.Function, sizeof(void*), old, &old);
+                    }
+                }
+}
+void nr_net_guard_scan(void)
+{
+    if (!r_connect) return;
+    static volatile LONG busy;
+    if (InterlockedExchange(&busy, 1)) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32W me; me.dwSize = sizeof me;
+        HMODULE ws = GetModuleHandleA("ws2_32.dll");
+        for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+            if (me.hModule != ws) patch_module(me.hModule);
+        CloseHandle(snap);
+    }
+    InterlockedExchange(&busy, 0);
+}
+static DWORD WINAPI guard_thread(void* p) { (void)p; for (;;) { Sleep(2000); nr_net_guard_scan(); } }
+void nr_net_guard_start(void)
+{
+    if (r_connect) return;
+    HMODULE w = LoadLibraryA("ws2_32.dll");
+    r_wsaconnect = (wsaconnect_t)GetProcAddress(w, "WSAConnect");
+    r_sendto = (sendto_t)GetProcAddress(w, "sendto");
+    r_wsasendto = (wsasendto_t)GetProcAddress(w, "WSASendTo");
+    r_gai = (gai_t)GetProcAddress(w, "getaddrinfo");
+    r_gaiw = (gaiw_t)GetProcAddress(w, "GetAddrInfoW");
+    r_ghbn = (ghbn_t)GetProcAddress(w, "gethostbyname");
+    r_connect = (connect_t)GetProcAddress(w, "connect");
+    nr_net_guard_scan();
+    CloseHandle(CreateThread(0, 0, guard_thread, 0, 0, 0));
+    nr_log("netrecomp: network policy: loopback%s%s\n", getenv("NR_NET_ALLOW") ? " + NR_NET_ALLOW=" : " only", getenv("NR_NET_ALLOW") ? getenv("NR_NET_ALLOW") : "");
 }
