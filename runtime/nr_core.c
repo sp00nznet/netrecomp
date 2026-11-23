@@ -7,6 +7,7 @@
  * in the catch filter. See docs/runtime.md. */
 #include "nrrt.h"
 #include <stdarg.h>
+#include <malloc.h>
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
@@ -505,6 +506,7 @@ void nr_throw_notsupported(const char* what)
 
 /* A hardware fault seen by several filters on its way up must become one
  * managed object, not one per filter. */
+static __declspec(thread) const NrMethodDesc* nr_inv_stack[64]; static __declspec(thread) int nr_inv_depth;   /* NR_DEBUG: methods nr_invoke is inside */
 static __declspec(thread) EXCEPTION_RECORD* last_rec;
 static __declspec(thread) void* last_obj;
 
@@ -517,7 +519,14 @@ void* nr_current_exception_object(struct _EXCEPTION_POINTERS* ep)
     switch (r->ExceptionCode)
     {
     case EXCEPTION_ACCESS_VIOLATION:
-        if (nr_debug()) { nr_log("netrecomp: access violation at %p (address %p)\n", r->ExceptionAddress, (void*)r->ExceptionInformation[1]); nr_print_ctx_stack(ep->ContextRecord); }
+        if (nr_debug())
+        {
+            HMODULE mod = 0; char mn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r->ExceptionAddress, &mod)) GetModuleFileNameA(mod, mn, MAX_PATH);
+            nr_log("netrecomp: access violation at %p = %s+0x%llx (address %p)\n", r->ExceptionAddress, mn, (unsigned long long)((char*)r->ExceptionAddress - (char*)mod), (void*)r->ExceptionInformation[1]);
+            for (int d = nr_inv_depth; d-- > 0 && d >= nr_inv_depth - 6;) if (d < 64) nr_log("netrecomp:   in invoke[%d] %s.%s::%s\n", d, nr_inv_stack[d]->klass->ns, nr_inv_stack[d]->klass->name, nr_inv_stack[d]->name);
+            nr_print_ctx_stack(ep->ContextRecord);
+        }
         name = "NullReferenceException"; msg = "Object reference not set to an instance of an object"; break;
     case EXCEPTION_INT_DIVIDE_BY_ZERO: name = "DivideByZeroException"; msg = "Division by zero"; break;
     case EXCEPTION_INT_OVERFLOW: name = "ArithmeticException"; msg = "Overflow"; break;
@@ -999,7 +1008,10 @@ void* nr_virtual_desc(const NrMethodDesc* m, void* obj, const NrMethodDesc** out
 
 void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
 {
-    uint64_t raw[16];
+    uint64_t small[16];
+    /* the invoker writes the whole return value here: a large struct (BATTLETECH's
+       CombatUIConstants) overruns any fixed buffer and with it this frame */
+    void* raw = m->ret && !nr_is_ref(m->ret) && m->ret->value_size > (int32_t)sizeof small ? _alloca((size_t)m->ret->value_size + 16) : small;
     void* ret = 0;
     if (exc) *exc = 0;
     if (!m->fn || !m->invoke)
@@ -1017,6 +1029,8 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
     void* boxed_this = obj;
     if (obj && (m->klass->flags & NR_VALUETYPE) && ((NrObj*)obj)->klass == m->klass && !(m->flags & 0x10))
         obj = (char*)obj + sizeof(NrObj);   /* boxed receiver for a value-type method */
+    if (nr_inv_depth < 64) nr_inv_stack[nr_inv_depth] = m;
+    nr_inv_depth++;
     __try
     {
         m->invoke(m->fn, obj, args, raw);
@@ -1025,9 +1039,11 @@ void* nr_invoke(const NrMethodDesc* m, void* obj, void** args, void** exc)
             ret = nr_is_ref(rk) ? *(void**)raw : nr_box(rk, raw);
     }
     __except (nr_catch(GetExceptionInformation(), 0, (void**)&e)) { }
+    nr_inv_depth--;
     (void)boxed_this;
     if (e)
     {
+        if (nr_debug()) nr_log("netrecomp:   in %s.%s::%s\n", m->klass->ns, m->klass->name, m->name);
         if (exc) { *exc = e; return 0; }
         nr_throw(e);
     }
