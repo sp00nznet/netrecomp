@@ -2216,6 +2216,7 @@ static void nr_register_corlib4_icalls(void)
         { "System.GC::GetGeneration", GC_GetGeneration },
         { "System.GC::RecordPressure", GC_RecordPressure },
         { "System.GC::_Collect", GC_InternalCollect },
+        { "System.GC::GetMaxGeneration", GC_get_MaxGeneration },
         { "System.DateTime::GetSystemTimeAsFileTime", DateTime_GetSystemTimeAsFileTime },
         { "System.CurrentSystemTimeZone::GetTimeZoneData", TimeZone_GetTimeZoneData4 },
         { "System.Environment::GetNewLine", Environment_GetNewLine },

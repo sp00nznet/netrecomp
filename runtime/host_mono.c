@@ -13,6 +13,7 @@
  *   MonoObject*, MonoString*, ...  the objects themselves (mono layout)
  * See docs/unity-host.md. */
 #include "nrrt.h"
+#include <intrin.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 
@@ -278,8 +279,20 @@ API NrClass* mono_class_from_name_case(NrImage* img, const char* ns, const char*
     }
     return 0;
 }
-API const char* mono_class_get_name(NrClass* k) { TR("mono_class_get_name"); return k->name; }
-API const char* mono_class_get_namespace(NrClass* k) { TR("mono_class_get_namespace"); return k->ns; }
+/* Unity sometimes hands over a class pointer read from a dead or foreign object;
+   log it (and who asked) instead of faulting inside the player. */
+static int bad_class(NrClass* k, const char* what, void* ra)
+{
+    __try { if (k && k->self == k) return 0; } __except (1) { }
+    HMODULE mod = 0; char mn[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ra, &mod)) GetModuleFileNameA(mod, mn, MAX_PATH);
+    const char* is = "";
+    __try { NrClass* ok = k && GC_base(k) ? ((NrObj*)k)->klass : 0; if (ok && ok->self == ok) is = ok->name; } __except (1) { }
+    nr_log("netrecomp: %s(%p): not a class (%s %s), called from %s+0x%llx\n", what, (void*)k, *is ? "an object of" : "base", *is ? is : (k && GC_base(k) ? "gc" : "non-gc"), mn, (unsigned long long)((char*)ra - (char*)mod));
+    return 1;
+}
+API const char* mono_class_get_name(NrClass* k) { TR("mono_class_get_name"); return bad_class(k, "mono_class_get_name", _ReturnAddress()) ? "" : k->name; }
+API const char* mono_class_get_namespace(NrClass* k) { TR("mono_class_get_namespace"); return bad_class(k, "mono_class_get_namespace", _ReturnAddress()) ? "" : k->ns; }
 API NrClass* mono_class_get_parent(NrClass* k) { TR("mono_class_get_parent"); return (k->flags & NR_INTERFACE) ? 0 : k->parent; }
 API NrImage* mono_class_get_image(NrClass* k) { TR("mono_class_get_image"); return k->image; }
 API uint32_t mono_class_get_flags(NrClass* k) { TR("mono_class_get_flags"); return k->attrs; }
