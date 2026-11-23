@@ -509,6 +509,33 @@ static int in_image(const void* p)
     return (const char*)p >= b && (const char*)p < b + nt->OptionalHeader.SizeOfImage;
 }
 
+/* NR_INVSTAT: every 30 s, the methods the player invoked most on its main thread */
+static int invstat_on = -1;
+static struct { const NrMethodDesc* m; int n, threw; } invstat[512];
+static ULONGLONG invstat_t;
+static void invstat_note(const NrMethodDesc* m, int threw)
+{
+    if (invstat_on < 0) invstat_on = GetEnvironmentVariableA("NR_INVSTAT", 0, 0) > 0;
+    if (!invstat_on || !m || GetCurrentThreadId() != shot_thread) return;
+    unsigned h = (unsigned)(((uintptr_t)m >> 4) * 2654435761u) % 512;
+    for (int i = 0; i < 512; i++, h = (h + 1) % 512)
+        if (!invstat[h].m || invstat[h].m == m) { invstat[h].m = m; invstat[h].n++; invstat[h].threw += threw; break; }
+    ULONGLONG now = GetTickCount64();
+    if (!invstat_t) invstat_t = now;
+    if (now - invstat_t < 30000) return;
+    invstat_t = now;
+    nr_log("netrecomp: invstat (30 s):\n");
+    for (int k = 0; k < 25; k++)
+    {
+        int b = -1;
+        for (int i = 0; i < 512; i++) if (invstat[i].m && invstat[i].n > 0 && (b < 0 || invstat[i].n > invstat[b].n)) b = i;
+        if (b < 0) break;
+        nr_log("  %7d %s.%s::%s%s\n", invstat[b].n, invstat[b].m->klass->ns, invstat[b].m->klass->name, invstat[b].m->name, invstat[b].threw ? " (threw)" : "");
+        invstat[b].n = -invstat[b].n;
+    }
+    memset(invstat, 0, sizeof invstat);
+}
+
 API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, void** exc)
 {
     TR("mono_runtime_invoke");
@@ -518,6 +545,7 @@ API void* mono_runtime_invoke(const NrMethodDesc* m, void* obj, void** params, v
        (Unity 4.5+ calls ISerializationCallbackReceiver this way) */
     if (obj && (m->flags & 0x400) && in_image(*(void**)obj)) m = mono_object_get_virtual_method(obj, m);
     void* r = nr_invoke(m, obj, params, exc);
+    invstat_note(m, exc && *exc);
     if (trace_on > 0) nr_log("[mono]   %s::%s%s\n", m->klass->name, m->name, exc && *exc ? " threw" : "");
     return r;
 }

@@ -301,15 +301,40 @@ static void* MonoType_GetMethodsByName(void* self, void* name, int32_t bf, uint8
     if (n) memcpy(adata(a), tmp, sizeof(void*) * n);
     return a;
 }
+/* An array type's runtime constructor, .ctor(int32 x rank), as mono reports it
+ * (Activator.CreateInstance(typeof(T[]), n)). It has no body: invoke() allocates. */
+static const NrMethodDesc* array_ctor(NrClass* k)
+{
+    if (!(k->flags & NR_ARRAY) || k->rank < 1 || k->rank > 8) return 0;
+    static struct ACtor { NrClass* k; NrMethodDesc d; struct ACtor* next; }* list;
+    static NrClass* ints[8];
+    EnterCriticalSection(&cache_lock);
+    struct ACtor* a = list;
+    while (a && a->k != k) a = a->next;
+    if (!a)
+    {
+        if (!ints[0]) for (int i = 0; i < 8; i++) ints[i] = nr_class_by_name("System", "Int32");
+        a = (struct ACtor*)calloc(1, sizeof *a);
+        a->k = k;
+        a->d.klass = k; a->d.name = ".ctor"; a->d.flags = 0x1806;   /* public, special names */
+        a->d.n_params = k->rank; a->d.slot = -1; a->d.ret = nr_class_by_name("System", "Void"); a->d.params = ints;
+        a->next = list; list = a;
+    }
+    LeaveCriticalSection(&cache_lock);
+    return &a->d;
+}
 static void* MonoType_GetConstructors_internal(void* self, int32_t bf, void* reftype)
 {
     (void)reftype;
     NrClass* k = K(self);
     int n = 0;
+    const NrMethodDesc* ac = array_ctor(k);
+    if (ac && !bind_ok(ac->flags, bf, 0)) ac = 0;
     for (int i = 0; i < k->n_methods; i++) if (!strcmp(k->methods[i].name, ".ctor") && bind_ok(k->methods[i].flags, bf, 0)) n++;
-    void* a = new_array(nr_class_by_name("System.Reflection", "ConstructorInfo"), n);
+    void* a = new_array(nr_class_by_name("System.Reflection", "ConstructorInfo"), n + (ac != 0));
     int j = 0;
     for (int i = 0; i < k->n_methods; i++) if (!strcmp(k->methods[i].name, ".ctor") && bind_ok(k->methods[i].flags, bf, 0)) adata(a)[j++] = nr_method_object(&k->methods[i]);
+    if (ac) adata(a)[j++] = nr_method_object(ac);
     return a;
 }
 static void* MonoType_GetFields_internal(void* self, int32_t bf, void* reftype)
@@ -729,6 +754,16 @@ static void* invoke(void* mobj, void* obj, void* params, void** exc, int ctor)
             argv[i] = (char*)*slot + sizeof(NrObj);
         }
         else argv[i] = byref ? (void*)slot : *slot;
+    }
+    if (ctor && !obj && (m->klass->flags & NR_ARRAY) && !m->fn)
+    {
+        int32_t lens[8];
+        for (int i = 0; i < n && i < 8; i++)
+        {
+            lens[i] = *(int32_t*)argv[i];
+            if (lens[i] < 0) nr_throw_new("System", "OverflowException", "Arithmetic operation resulted in an overflow.");
+        }
+        return n == 1 ? nr_newarr(m->klass, lens[0]) : nr_new_mdarray(m->klass, n, lens);
     }
     if (ctor && !obj)
     {
