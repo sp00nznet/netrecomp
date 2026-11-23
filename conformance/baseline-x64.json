@@ -1,6 +1,6 @@
 {
-  "passed": 12,
-  "total": 14,
+  "passed": 13,
+  "total": 15,
   "results": {
     "basics": "PASS",
     "collections": "FAIL (output)",
@@ -15,6 +15,7 @@
     "seh": "PASS",
     "sockets": "FAIL (output)",
     "strings": "PASS",
-    "structs": "PASS"
+    "structs": "PASS",
+    "culture": "PASS"
   }
 }
