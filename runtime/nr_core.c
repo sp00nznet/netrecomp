@@ -133,8 +133,35 @@ static int32_t finalize_slot = -1;
  * type only Activator creates) has no vtable; borrow the nearest ancestor's so the
  * Object methods (ToString, Equals, GetHashCode) still dispatch.
  * ponytail: overrides on such a class are not seen; construct it in the lift if one matters. */
+static void adopt(NrClass* k, NrClass* c)
+{
+    k->n_vtable = c->n_vtable; k->vtable = c->vtable;
+    /* keep k's own interface list (casts test it), with the canonical slot offsets */
+    NrIface* m = (NrIface*)malloc(sizeof(NrIface) * (k->n_ifaces + c->n_ifaces + 1));
+    int n = 0;
+    for (int a = 0; a < k->n_ifaces; a++)
+    {
+        m[n] = k->ifaces[a];
+        for (int b = 0; b < c->n_ifaces && m[n].offset < 0; b++)
+        {
+            NrClass *x = c->ifaces[b].iface, *y = k->ifaces[a].iface;
+            if (x == y || (x->n_gargs == y->n_gargs && !strcmp(x->name, y->name) && !strcmp(x->ns, y->ns))) m[n].offset = c->ifaces[b].offset;
+        }
+        n++;
+    }
+    for (int b = 0; b < c->n_ifaces; b++) m[n++] = c->ifaces[b];
+    k->ifaces = m; k->n_ifaces = (uint16_t)n;
+}
+
 static void borrow_vtable(NrClass* k)
 {
+    /* a reference-type T[] the lift never allocated shares object[]'s code: vtable and
+       interface map (IEnumerable, IList, ...), keeping its own generic interfaces */
+    if ((k->flags & NR_ARRAY) && k->rank == 1 && nr_is_ref(k->elem) && k->elem != nr_k_object)
+    {
+        NrClass* c = nr_array_class(nr_k_object, 1);
+        if (c != k && c->vtable) { adopt(k, c); return; }
+    }
     /* a generic instance shares its canonical instance's code: vtable and interface map */
     if (k->flags & NR_GENERIC_INST)
         for (int i = 0; i < nr_n_classes; i++)
@@ -146,22 +173,7 @@ static void borrow_vtable(NrClass* k)
             for (int j = 0; j < k->n_gargs && ok; j++)
                 ok = c->gargs[j] == k->gargs[j] || (nr_is_ref(k->gargs[j]) && nr_is_ref(c->gargs[j]) && nr_assignable(c->gargs[j], k->gargs[j]));
             if (!ok) continue;
-            k->n_vtable = c->n_vtable; k->vtable = c->vtable;
-            /* keep k's own interface list (casts test it), with the canonical slot offsets */
-            NrIface* m = (NrIface*)malloc(sizeof(NrIface) * (k->n_ifaces + c->n_ifaces + 1));
-            int n = 0;
-            for (int a = 0; a < k->n_ifaces; a++)
-            {
-                m[n] = k->ifaces[a];
-                for (int b = 0; b < c->n_ifaces && m[n].offset < 0; b++)
-                {
-                    NrClass *x = c->ifaces[b].iface, *y = k->ifaces[a].iface;
-                    if (x == y || (x->n_gargs == y->n_gargs && !strcmp(x->name, y->name) && !strcmp(x->ns, y->ns))) m[n].offset = c->ifaces[b].offset;
-                }
-                n++;
-            }
-            for (int b = 0; b < c->n_ifaces; b++) m[n++] = c->ifaces[b];
-            k->ifaces = m; k->n_ifaces = (uint16_t)n;
+            adopt(k, c);
             return;
         }
     NrClass* p = (k->flags & NR_VALUETYPE) && !(k->flags & NR_ENUM) ? nr_k_valuetype : k->parent;
@@ -192,6 +204,9 @@ void* nr_new(NrClass* k)
 void* nr_newarr(NrClass* k, int32_t n)
 {
     if (n < 0) nr_throw_overflow();
+    /* a generated T[] the lift saw named but never allocated has no vtable (Chronicles:
+       JsonFx made CharacterTypeDifficultyEntry[] by reflection, then ToString faulted) */
+    if (!k->vtable) borrow_vtable(k);
     uint64_t size = offsetof(NrArray, vector) + (uint64_t)k->elem_size * (uint32_t)n;
     if (size > 0x7fffffff) nr_throw_new("System", "OutOfMemoryException", "Array too large");
     NrArray* a = (NrArray*)gc_alloc(k, (size_t)size);
